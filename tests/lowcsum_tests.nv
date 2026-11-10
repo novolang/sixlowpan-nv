@@ -12,7 +12,6 @@
 // and the checksum is 0xFFFF - 0x308d = 0xcf72, which is 53106.
 
 use std.test
-use lowpan
 use lowcsum
 
 fn payload_datagram() -> Vec[u8; 1280]
