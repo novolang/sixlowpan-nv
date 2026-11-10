@@ -1,0 +1,419 @@
+// lowpan.nv — the first byte of a 6LoWPAN frame, the mesh and broadcast
+// headers, and the addresses the headers refer to.
+//
+// 6LoWPAN carries IPv6 over IEEE 802.15.4, whose frames hold at most 127
+// bytes.  The payload of such a frame begins with a dispatch byte whose
+// top bits say what follows (RFC 4944 section 5.1, with RFC 6282
+// section 5):
+//
+//   00 xxxxxx   NALP      not a LoWPAN frame; the frame is dropped
+//   01 000001   IPV6      an uncompressed IPv6 header follows
+//   01 000010   HC1       the compression of RFC 4944, obsolete
+//   01 010000   BC0       a broadcast header follows
+//   01 1xxxxx   IPHC      the compression of RFC 6282 follows
+//   10 xxxxxx   MESH      a mesh header follows
+//   11 000xxx   FRAG1     the first fragment of a datagram
+//   11 100xxx   FRAGN     a later fragment
+//
+// Headers stack in a fixed order: a mesh header, then a broadcast header,
+// then a fragment header, then the IPv6 dispatch.  `inspect` walks them and
+// says where the datagram's own bytes begin.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A frame is a
+// `Vec[u8; SIXLO_FRAME_MAX]` the caller owns, read in place.
+//
+// ADDRESSES.  An IPv6 address is four 32-bit words held in `Int`s, the
+// first word the most significant, so a prefix comparison is an integer
+// comparison and no word is ever negative.  An IEEE 802.15.4 address is a
+// 16-bit short address or a 64-bit extended address; `LinkAddr` holds either.
+
+// The most bytes of a frame's payload this package reads or writes.  An
+// IEEE 802.15.4 frame is at most 127 bytes.
+pub const SIXLO_FRAME_MAX = 128
+// The most bytes of an IPv6 datagram, before compression: the IPv6 minimum
+// link MTU, which every 6LoWPAN link must carry (RFC 4944 section 4).
+pub const SIXLO_DG_MAX = 1280
+
+// A frame payload.
+pub alias Frame = Vec[u8; SIXLO_FRAME_MAX]
+// An uncompressed IPv6 datagram.
+pub alias Datagram = Vec[u8; SIXLO_DG_MAX]
+
+// What the first byte of a frame says it is.
+pub const SIXLO_KIND_NALP = 0
+// An uncompressed IPv6 header follows (dispatch 01000001).
+pub const SIXLO_KIND_IPV6 = 1
+// LOWPAN_HC1, 01000010: recognised and not decoded.
+pub const SIXLO_KIND_HC1 = 2
+// A broadcast header (BC0, 01010000).
+pub const SIXLO_KIND_BC0 = 3
+// LOWPAN_IPHC, 011xxxxx.
+pub const SIXLO_KIND_IPHC = 4
+// A mesh header, 10xxxxxx.
+pub const SIXLO_KIND_MESH = 5
+// The first fragment, 11000xxx.
+pub const SIXLO_KIND_FRAG1 = 6
+// A later fragment, 11100xxx.
+pub const SIXLO_KIND_FRAGN = 7
+// A pattern RFC 4944 reserves or leaves unassigned, including ESC.
+pub const SIXLO_KIND_RESERVED = 8
+
+// The kind of frame a first byte starts.
+//
+// ```novo
+// use lowpan
+//
+// fn main() [io]
+//     println("${lowpan.kind_of(0x7a) == lowpan.SIXLO_KIND_IPHC}")     // true
+//     println("${lowpan.kind_of(0xc5) == lowpan.SIXLO_KIND_FRAG1}")    // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn kind_of(b: Int) -> Int []
+    let top = b >> 6
+    if top == 0
+        SIXLO_KIND_NALP
+    else if top == 1
+        if b >= 0x60
+            SIXLO_KIND_IPHC
+        else if b == 0x41
+            SIXLO_KIND_IPV6
+        else if b == 0x42
+            SIXLO_KIND_HC1
+        else if b == 0x50
+            SIXLO_KIND_BC0
+        else
+            SIXLO_KIND_RESERVED
+    else if top == 2
+        SIXLO_KIND_MESH
+    else if (b & 0xF8) == 0xC0
+        SIXLO_KIND_FRAG1
+    else if (b & 0xF8) == 0xE0
+        SIXLO_KIND_FRAGN
+    else
+        SIXLO_KIND_RESERVED
+
+// ── Addresses ────────────────────────────────────────────────────────
+
+// An IPv6 address as four 32-bit words, most significant first.
+pub @value
+struct Ip6
+    w0: Int
+    w1: Int
+    w2: Int
+    w3: Int
+
+// An IEEE 802.15.4 address.  `kind` is `SIXLO_LL_NONE`, `SIXLO_LL_SHORT` or
+// `SIXLO_LL_EXTENDED`.  A short address is in `b`, 16 bits.  An extended
+// address, an EUI-64, is `a` for its first four bytes and `b` for its last
+// four.
+pub @value
+struct LinkAddr
+    kind: Int
+    a: Int
+    b: Int
+
+// A link address that is not known.
+pub const SIXLO_LL_NONE = 0
+// A 16-bit short address.
+pub const SIXLO_LL_SHORT = 1
+// A 64-bit extended address.
+pub const SIXLO_LL_EXTENDED = 2
+
+// The link address of nothing.
+pub @tier(embedded)
+@no_alloc
+fn ll_none() -> LinkAddr []
+    LinkAddr { kind: SIXLO_LL_NONE, a: 0, b: 0 }
+
+// A 16-bit short address.
+pub @tier(embedded)
+@no_alloc
+fn ll_short(s: Int) -> LinkAddr []
+    LinkAddr { kind: SIXLO_LL_SHORT, a: 0, b: s & 0xFFFF }
+
+// A 64-bit extended address from its first and last four bytes.
+pub @tier(embedded)
+@no_alloc
+fn ll_extended(first: Int, last: Int) -> LinkAddr []
+    LinkAddr { kind: SIXLO_LL_EXTENDED, a: first & 0xFFFFFFFF, b: last & 0xFFFFFFFF }
+
+// The address built from four words.
+pub @tier(embedded)
+@no_alloc
+fn ip6(w0: Int, w1: Int, w2: Int, w3: Int) -> Ip6 []
+    Ip6 { w0: w0 & 0xFFFFFFFF, w1: w1 & 0xFFFFFFFF, w2: w2 & 0xFFFFFFFF, w3: w3 & 0xFFFFFFFF }
+
+// Whether two addresses are the same address.
+pub @tier(embedded)
+@no_alloc
+fn ip6_eq(a: Ip6, b: Ip6) -> Bool []
+    a.w0 == b.w0 and a.w1 == b.w1 and a.w2 == b.w2 and a.w3 == b.w3
+
+// The word of an address by index, 0 through 3.
+pub @tier(embedded)
+@no_alloc
+fn ip6_word(a: Ip6, i: Int) -> Int []
+    if i == 0
+        a.w0
+    else if i == 1
+        a.w1
+    else if i == 2
+        a.w2
+    else
+        a.w3
+
+// Byte `i` of an address, 0 through 15, counting from the first.
+pub @tier(embedded)
+@no_alloc
+fn ip6_byte(a: Ip6, i: Int) -> Int []
+    (ip6_word(a, i >> 2) >> (8 * (3 - (i & 3)))) & 0xFF
+
+// The unspecified address, `::`.
+pub @tier(embedded)
+@no_alloc
+fn ip6_unspecified() -> Ip6 []
+    Ip6 { w0: 0, w1: 0, w2: 0, w3: 0 }
+
+// Whether the address is `::`.
+pub @tier(embedded)
+@no_alloc
+fn is_unspecified(a: Ip6) -> Bool []
+    a.w0 == 0 and a.w1 == 0 and a.w2 == 0 and a.w3 == 0
+
+// Whether the address is a multicast address, `ff00::/8`.
+pub @tier(embedded)
+@no_alloc
+fn is_multicast(a: Ip6) -> Bool []
+    (a.w0 >> 24) == 0xFF
+
+// Whether the address is in `fe80::/64`, the prefix 6LoWPAN elides for a
+// link-local address.
+pub @tier(embedded)
+@no_alloc
+fn is_link_local(a: Ip6) -> Bool []
+    a.w0 == 0xFE800000 and a.w1 == 0
+
+// The interface identifier of an IEEE 802.15.4 address, as the two words of
+// an address's lower half (RFC 6282 section 3.2.2).
+//
+// An extended address is an EUI-64 with the universal/local bit inverted,
+// RFC 4291 appendix A.  A short address is `0000:00ff:fe00:XXXX` with the
+// universal/local bit zero.  No address gives zeros.
+pub @tier(embedded)
+@no_alloc
+fn iid_word2(l: LinkAddr) -> Int []
+    if l.kind == SIXLO_LL_EXTENDED
+        l.a ^ 0x02000000
+    else if l.kind == SIXLO_LL_SHORT
+        0x000000FF
+    else
+        0
+
+// The last four bytes of the interface identifier of a link address.
+pub @tier(embedded)
+@no_alloc
+fn iid_word3(l: LinkAddr) -> Int []
+    if l.kind == SIXLO_LL_EXTENDED
+        l.b
+    else if l.kind == SIXLO_LL_SHORT
+        0xFE000000 | l.b
+    else
+        0
+
+// The link-local address of a node whose link address is `l`.
+//
+// ```novo
+// use lowpan
+//
+// fn main() [io]
+//     let a = lowpan.link_local(lowpan.ll_short(0x1234))
+//     println("${lowpan.ip6_byte(a, 0)} ${lowpan.ip6_byte(a, 14)} ${lowpan.ip6_byte(a, 15)}")   // 254 18 52
+// ```
+pub @tier(embedded)
+@no_alloc
+fn link_local(l: LinkAddr) -> Ip6 []
+    Ip6 { w0: 0xFE800000, w1: 0, w2: iid_word2(l), w3: iid_word3(l) }
+
+// ── The mesh header ──────────────────────────────────────────────────
+
+// The mesh header of RFC 4944 section 5.2, read.
+//
+//    10 V F HopsLeft | originator | final destination
+//
+// `V` says the originator is a 16-bit short address and not an EUI-64, `F`
+// the same for the final destination.  Hops Left is four bits; the value
+// 0xF means that a byte of Deep Hops Left follows.  `ok` is false for a
+// header that runs past the frame; no other field means anything then.
+// `len` is the header's size in bytes.
+pub @value
+struct MeshHeader
+    ok: Bool
+    hops_left: Int
+    originator: LinkAddr
+    destination: LinkAddr
+    len: Int
+
+// The link address of `n` bytes at `at` in the frame, 2 for a short one and
+// 8 for an extended one.
+@tier(embedded)
+@no_alloc
+fn read_link(var f: Frame, at: Int, short: Bool) -> LinkAddr
+    if short
+        ll_short((f[at] as Int << 8) | f[at + 1] as Int)
+    else
+        let first = (f[at] as Int << 24) | (f[at + 1] as Int << 16) | (f[at + 2] as Int << 8) | f[at + 3] as Int
+        let last = (f[at + 4] as Int << 24) | (f[at + 5] as Int << 16) | (f[at + 6] as Int << 8) | f[at + 7] as Int
+        ll_extended(first, last)
+
+// Read the mesh header that starts at `at`.
+//
+// The first byte has to be a mesh dispatch, `10xxxxxx`; otherwise `ok` is
+// false.  RFC 4944 section 5.2 defines no forwarding policy for the header
+// here: the fields are returned, and routing on them is the caller's.
+//
+// ```novo
+// use lowpan
+//
+// fn main() [io]
+//     // 10 V=1 F=1 hops=5 | originator 0x0001 | destination 0x0002
+//     var f: Vec[u8; 128] = Vec.new()
+//     for b in [0xb5, 0x00, 0x01, 0x00, 0x02]
+//         let _p = f.push(b as u8)
+//     let m = lowpan.mesh_header(var f, 0)
+//     println("${m.ok} ${m.hops_left} ${m.originator.b} ${m.destination.b} ${m.len}")   // true 5 1 2 5
+// ```
+pub @tier(embedded)
+@no_alloc
+fn mesh_header(var f: Frame, at: Int) -> MeshHeader []
+    let bad = MeshHeader { ok: false, hops_left: 0, originator: ll_none(), destination: ll_none(), len: 0 }
+    if at < 0 or at >= f.len()
+        return bad
+    let b = f[at] as Int
+    if (b >> 6) != 2
+        return bad
+    let short_orig = (b & 0x20) != 0
+    let short_dest = (b & 0x10) != 0
+    var hops = b & 0x0F
+    var pos = at + 1
+    if hops == 0x0F
+        if pos >= f.len()
+            return bad
+        hops = f[pos] as Int
+        pos = pos + 1
+    var olen = 8
+    if short_orig
+        olen = 2
+    var dlen = 8
+    if short_dest
+        dlen = 2
+    if pos + olen + dlen > f.len()
+        return bad
+    let orig = read_link(var f, pos, short_orig)
+    let dest = read_link(var f, pos + olen, short_dest)
+    MeshHeader { ok: true,
+        hops_left: hops,
+        originator: orig,
+        destination: dest,
+        len: pos + olen + dlen - at }
+
+// ── Walking the headers ──────────────────────────────────────────────
+
+// Why a frame could not be walked: nothing was wrong.
+pub const SIXLO_VIEW_OK = 0
+// The frame is empty or a header runs past its end.
+pub const SIXLO_VIEW_SHORT = 1
+// A mesh header appears twice, or after a header that must follow it.
+pub const SIXLO_VIEW_ORDER = 2
+// The first byte of the frame is NALP, not a LoWPAN frame.
+pub const SIXLO_VIEW_NOT_LOWPAN = 3
+
+// What the headers at the front of a frame say.
+//
+// `status` is `SIXLO_VIEW_OK` or the fault.  `has_mesh`, `has_bc0` and
+// `has_frag` say which of the three optional headers stood in front of the
+// datagram.  `mesh` is the mesh header, `bc0_seq` the broadcast sequence
+// number.  `payload_kind` is the kind of the dispatch that follows them all,
+// one of `SIXLO_KIND_IPV6`, `SIXLO_KIND_IPHC`, `SIXLO_KIND_FRAG1`,
+// `SIXLO_KIND_FRAGN`, `SIXLO_KIND_HC1` or `SIXLO_KIND_RESERVED`, and
+// `payload_off` its index.  A fragment header is not consumed: `payload_off`
+// points at it, because `lowfrag` reads it.
+pub @value
+struct FrameView
+    status: Int
+    has_mesh: Bool
+    has_bc0: Bool
+    mesh: MeshHeader
+    bc0_seq: Int
+    payload_kind: Int
+    payload_off: Int
+
+// The view of a fault.
+@tier(embedded)
+@no_alloc
+fn view_fault(status: Int, has_mesh: Bool, has_bc0: Bool, mesh: MeshHeader, seq: Int) -> FrameView
+    FrameView { status: status, has_mesh: has_mesh, has_bc0: has_bc0, mesh: mesh, bc0_seq: seq,
+                payload_kind: SIXLO_KIND_RESERVED, payload_off: 0 }
+
+// Walk the mesh and broadcast headers at the front of a frame and say what
+// follows them.
+//
+// The order is the one RFC 4944 section 5 gives: at most one mesh header,
+// then at most one broadcast header, then the fragment or IPv6 dispatch.
+// A NALP frame is `SIXLO_VIEW_NOT_LOWPAN`.  Nothing past the first of the
+// payload dispatches is read.
+//
+// ```novo
+// use lowpan
+//
+// fn main() [io]
+//     // BC0, sequence 7, then an IPHC dispatch.
+//     var f: Vec[u8; 128] = Vec.new()
+//     for b in [0x50, 0x07, 0x7a, 0x33]
+//         let _p = f.push(b as u8)
+//     let v = lowpan.inspect(var f)
+//     println("${v.has_bc0} ${v.bc0_seq} ${v.payload_kind == lowpan.SIXLO_KIND_IPHC} ${v.payload_off}")   // true 7 true 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn inspect(var f: Frame) -> FrameView []
+    var pos = 0
+    var mesh = MeshHeader { ok: false, hops_left: 0, originator: ll_none(), destination: ll_none(), len: 0 }
+    var has_mesh = false
+    var has_bc0 = false
+    var seq = 0
+    for _step in 0..2
+        if pos >= f.len()
+            return view_fault(SIXLO_VIEW_SHORT, has_mesh, has_bc0, mesh, seq)
+        let kind = kind_of(f[pos] as Int)
+        if kind == SIXLO_KIND_NALP
+            return view_fault(SIXLO_VIEW_NOT_LOWPAN, has_mesh, has_bc0, mesh, seq)
+        if kind == SIXLO_KIND_MESH
+            if has_mesh or has_bc0
+                return view_fault(SIXLO_VIEW_ORDER, has_mesh, has_bc0, mesh, seq)
+            mesh = mesh_header(var f, pos)
+            if not mesh.ok
+                return view_fault(SIXLO_VIEW_SHORT, false, has_bc0, mesh, seq)
+            has_mesh = true
+            pos = pos + mesh.len
+        else if kind == SIXLO_KIND_BC0
+            if has_bc0
+                return view_fault(SIXLO_VIEW_ORDER, has_mesh, has_bc0, mesh, seq)
+            if pos + 1 >= f.len()
+                return view_fault(SIXLO_VIEW_SHORT, has_mesh, false, mesh, seq)
+            seq = f[pos + 1] as Int
+            has_bc0 = true
+            pos = pos + 2
+        else
+            return FrameView { status: SIXLO_VIEW_OK, has_mesh: has_mesh, has_bc0: has_bc0, mesh: mesh, bc0_seq: seq,
+                               payload_kind: kind, payload_off: pos }
+    // Two headers have been taken, a mesh header and a broadcast header; what is next has to be the payload.
+    if pos >= f.len()
+        return view_fault(SIXLO_VIEW_SHORT, has_mesh, has_bc0, mesh, seq)
+    let last = kind_of(f[pos] as Int)
+    if last == SIXLO_KIND_NALP
+        return view_fault(SIXLO_VIEW_NOT_LOWPAN, has_mesh, has_bc0, mesh, seq)
+    if last == SIXLO_KIND_MESH or last == SIXLO_KIND_BC0
+        return view_fault(SIXLO_VIEW_ORDER, has_mesh, has_bc0, mesh, seq)
+    FrameView { status: SIXLO_VIEW_OK, has_mesh: has_mesh, has_bc0: has_bc0, mesh: mesh, bc0_seq: seq,
+                payload_kind: last, payload_off: pos }

@@ -1,0 +1,167 @@
+// lowctx.nv — the table of contexts that stateful header compression uses.
+//
+// LOWPAN_IPHC can elide the prefix of an address when the prefix is the
+// same as one the whole network has agreed on.  The agreement is a context:
+// a number from 0 to 15 and the prefix it stands for, up to 128 bits long
+// (RFC 6282 section 3.1.2).  How the contexts are learnt and kept alive is
+// out of its scope; RFC 6775 section 4.2 carries them in Router
+// Advertisements, with a lifetime and a flag, C, that says whether the
+// context may be used to compress or only to expand.  Here the table is
+// state the caller keeps and changes: `ctx_set` is what the arrival of a
+// context option calls, and `ctx_clear` what its expiry calls.
+//
+// A context holds a prefix of `len` bits.  Bits of the address past `len`
+// are not covered by the context; compression carries them in-line or
+// derives them from the link address.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+
+use lowpan
+
+// How many contexts there are: 16, numbers 0 through 15.
+pub const SIXLO_CONTEXTS = 16
+
+// One context.  A context that is not `valid` is not in use.  `compress`
+// is the C flag of RFC 6775: a context with it clear is used to expand an
+// address and never to compress one.  `len` is the prefix length in bits,
+// 1 to 128, and the words hold the prefix with every bit past `len` zero.
+pub @value
+struct LowpanContext
+    valid: Bool
+    compress: Bool
+    len: Int
+    w0: Int
+    w1: Int
+    w2: Int
+    w3: Int
+
+// The table: 16 contexts, numbered by their index.
+pub alias ContextTable = Vec[LowpanContext; 16]
+
+// A context that is not in use.
+@tier(embedded)
+@no_alloc
+fn unused() -> LowpanContext
+    LowpanContext { valid: false, compress: false, len: 0, w0: 0, w1: 0, w2: 0, w3: 0 }
+
+// A table in which no context is in use.
+//
+// ```novo
+// use lowctx
+//
+// fn main() [io]
+//     var t = lowctx.ctx_table()
+//     println("${t.len()} ${lowctx.ctx_get(var t, 0).valid}")   // 16 false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ctx_table() -> ContextTable []
+    var t: ContextTable = Vec.new()
+    for _i in 0..SIXLO_CONTEXTS
+        let _p = t.push(unused())
+    t
+
+// The mask of the bits of 32-bit word `i` that a prefix of `len` bits covers.
+//
+// ```novo
+// use lowctx
+//
+// fn main() [io]
+//     println("${lowctx.prefix_mask(48, 1)}")   // 4294901760, that is 0xFFFF0000
+// ```
+pub @tier(embedded)
+@no_alloc
+fn prefix_mask(len: Int, i: Int) -> Int []
+    var n = len - 32 * i
+    if n < 0
+        n = 0
+    if n > 32
+        n = 32
+    if n == 0
+        0
+    else
+        (((1 << n) - 1) << (32 - n)) & 0xFFFFFFFF
+
+// Put a prefix into context `id`.
+//
+// `prefix` is cut to its first `len` bits.  Answers false, and changes
+// nothing, for an `id` outside 0 through 15 or a `len` outside 1 through
+// 128.
+pub @tier(embedded)
+@no_alloc
+fn ctx_set(var t: ContextTable, id: Int, prefix: Ip6, len: Int, compress: Bool) -> Bool []
+    if id < 0 or id >= SIXLO_CONTEXTS or len < 1 or len > 128
+        return false
+    t[id] = LowpanContext { valid: true, compress: compress, len: len,
+                            w0: prefix.w0 & prefix_mask(len, 0), w1: prefix.w1 & prefix_mask(len, 1),
+                            w2: prefix.w2 & prefix_mask(len, 2), w3: prefix.w3 & prefix_mask(len, 3) }
+    true
+
+// Take context `id` out of use.  Answers false for an `id` outside 0
+// through 15.
+pub @tier(embedded)
+@no_alloc
+fn ctx_clear(var t: ContextTable, id: Int) -> Bool []
+    if id < 0 or id >= SIXLO_CONTEXTS
+        return false
+    t[id] = unused()
+    true
+
+// The context numbered `id`, or an unused one for a number outside 0
+// through 15.
+pub @tier(embedded)
+@no_alloc
+fn ctx_get(var t: ContextTable, id: Int) -> LowpanContext []
+    if id < 0 or id >= SIXLO_CONTEXTS
+        return unused()
+    t[id]
+
+// Whether the first `len` bits of `a` are the context's prefix.
+pub @tier(embedded)
+@no_alloc
+fn prefix_matches(c: LowpanContext, a: Ip6) -> Bool []
+    c.valid and (a.w0 & prefix_mask(c.len, 0)) == c.w0 and (a.w1 & prefix_mask(c.len, 1)) == c.w1
+        and (a.w2 & prefix_mask(c.len, 2)) == c.w2 and (a.w3 & prefix_mask(c.len, 3)) == c.w3
+
+// The number of the context to compress `a` with: the valid context whose
+// `compress` flag is set and whose prefix matches, the longest if several
+// do and the lowest number among equals.  -1 when none matches.
+//
+// ```novo
+// use lowpan
+// use lowctx
+//
+// fn main() [io]
+//     var t = lowctx.ctx_table()
+//     let _a = lowctx.ctx_set(var t, 3, lowpan.ip6(0x20010db8, 0, 0, 0), 64, true)
+//     println("${lowctx.ctx_find(var t, lowpan.ip6(0x20010db8, 0, 0, 5))}")   // 3
+//     println("${lowctx.ctx_find(var t, lowpan.ip6(0x20010db9, 0, 0, 5))}")   // -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn ctx_find(var t: ContextTable, a: Ip6) -> Int []
+    var best = -1
+    var best_len = 0
+    for id in 0..SIXLO_CONTEXTS
+        let c = t[id]
+        if c.compress and prefix_matches(c, a) and c.len > best_len
+            best = id
+            best_len = c.len
+    best
+
+// The address a context and an interface identifier make: the context's
+// prefix for the bits it covers, and the identifier's bits for the rest.
+// `iid2` and `iid3` are the two words of the lower 64 bits; the upper 64
+// bits come from the context alone.
+//
+// This is how RFC 6282 section 3.1.1 builds an address when SAC or DAC is
+// set: bits covered by the context are always the context's.
+pub @tier(embedded)
+@no_alloc
+fn with_prefix(c: LowpanContext, iid2: Int, iid3: Int) -> Ip6 []
+    let m2 = prefix_mask(c.len, 2)
+    let m3 = prefix_mask(c.len, 3)
+    Ip6 { w0: c.w0,
+        w1: c.w1,
+        w2: c.w2 | (iid2 & (0xFFFFFFFF ^ m2)),
+        w3: c.w3 | (iid3 & (0xFFFFFFFF ^ m3)) }

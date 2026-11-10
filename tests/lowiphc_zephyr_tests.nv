@@ -1,0 +1,210 @@
+// lowiphc_zephyr_tests.nv — the header cases of Zephyr's 6lo test, run through
+// this package.
+//
+// Zephyr's `tests/net/6lo/src/main.c` (zephyrproject-rtos/zephyr, last changed
+// by commit 9d38cb9cfc636ff4853bd8368855a49390fc79e6) defines a set of IPv6/UDP
+// headers, one for each combination of the address modes of RFC 6282, and the
+// number of bytes by which each must shrink: the size of the uncompressed
+// header less the sum of the sizes of the encodings it takes.  The sizes are
+// the macros at the top of that file: TF 4, 3, 1 or 0 bytes; SAM 16, 8, 2 or 0;
+// DAM 16, 8, 2, 0 for unicast and 16, 6, 4, 1 for multicast; the UDP ports 4,
+// 3, 3 or 1; the UDP checksum 2; the dispatch and the IPHC 2, the NHC 1, a
+// context byte 1.
+//
+// What is taken from that file is the headers (the vtc, tcflow and flow words,
+// the addresses and the ports, with a hop limit of 255 in every case) and the
+// size each compresses to.  Nothing else: Zephyr checks its own compressor
+// against its own expander, and the bytes of the compressed form are not in
+// the file.  Here the compressed size is measured and compared with the sum of
+// the sizes above, and the expansion is compared with the original.  The link
+// addresses are Zephyr's `src_mac` 02:00:00:00:00:00:aa:bb and `dst_mac`
+// 02:00:00:00:00:00:bb:aa, and the contexts are its 6CO options: aabb::/64 as
+// context 1 and ccdd::/64 as context 2.
+
+use std.test
+use std.bytes
+use lowpan
+use lowctx
+use lowiphc
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn zeros(n: Int) -> Str
+    var s = ""
+    for _i in 0..n
+        s = s + "00"
+    s
+
+fn h2(n: Int) -> Str
+    bytes.to_hex(bytes.u8(n))
+
+fn h4(n: Int) -> Str
+    bytes.to_hex(bytes.u16_be(n))
+
+fn load_dg(s: Str) -> Vec[u8; 1280]
+    var d: Vec[u8; 1280] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = d.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    d
+
+fn dg_hex(var d: Vec[u8; 1280]) -> Str
+    var b = bytes.zeros(d.len())
+    for i in 0..d.len()
+        bytes.set_u8(b, i, d[i] as Int)
+    bytes.to_hex(b)
+
+fn src_mac() -> LinkAddr
+    lowpan.ll_extended(0x02000000, 0x0000AABB)
+
+fn dst_mac() -> LinkAddr
+    lowpan.ll_extended(0x02000000, 0x0000BBAA)
+
+fn zephyr_contexts() -> ContextTable
+    var t = lowctx.ctx_table()
+    let _a = lowctx.ctx_set(var t, 1, lowpan.ip6(0xAABB0000, 0, 0, 0), 64, true)
+    let _b = lowctx.ctx_set(var t, 2, lowpan.ip6(0xCCDD0000, 0, 0, 0), 64, true)
+    t
+
+// The addresses of the file's macros.
+fn src_sac1_sam00() -> Str
+    zeros(16)
+
+fn src_sam00() -> Str
+    "2000" + zeros(14)
+
+fn src_sam01() -> Str
+    "fe80" + zeros(13) + "aa"
+
+fn src_sam10() -> Str
+    "fe80" + zeros(9) + "fffe0000bb"
+
+fn src_sam11() -> Str
+    "fe80" + zeros(12) + "aabb"
+
+fn dst_m1_dam00() -> Str
+    "ff00" + zeros(8) + "112233445566"
+
+fn dst_m1_dam01() -> Str
+    "ff11" + zeros(9) + "1122334455"
+
+fn dst_m1_dam10() -> Str
+    "ff11" + zeros(11) + "112233"
+
+fn dst_m1_dam11() -> Str
+    "ff02" + zeros(13) + "11"
+
+fn dst_dam00() -> Str
+    "2000" + zeros(14)
+
+fn dst_dam01() -> Str
+    "fe80" + zeros(13) + "aa"
+
+fn dst_dam10() -> Str
+    "fe80" + zeros(9) + "fffe0000bb"
+
+fn dst_dam11() -> Str
+    "fe80" + zeros(12) + "bbaa"
+
+fn src_sac1_sam01() -> Str
+    "aabb" + zeros(13) + "aa"
+
+fn dst_dac1_dam01() -> Str
+    "aabb" + zeros(13) + "aa"
+
+fn src_sac1_sam10() -> Str
+    "ccdd" + zeros(9) + "fffe0000bb"
+
+fn dst_dac1_dam10() -> Str
+    "ccdd" + zeros(9) + "fffe0000bb"
+
+fn src_sac1_sam11() -> Str
+    "aabb" + zeros(12) + "aabb"
+
+fn dst_dac1_dam11() -> Str
+    "ccdd" + zeros(12) + "bbaa"
+
+// 40 bytes of the file's `user_data`: "0123456789" four times.
+fn user_data() -> Str
+    "30313233343536373839" + "30313233343536373839" + "30313233343536373839" + "30313233343536373839"
+
+// An IPv6 header with the file's vtc, tcflow and flow words, hop limit 255,
+// and a UDP datagram of 40 payload bytes; the checksum is left in-line.
+fn udp_case(vtc: Int, tcflow: Int, flow: Int, src: Str, dst: Str, sport: Int, dport: Int) -> Str
+    h2(vtc) + h2(tcflow) + h4(flow) + h4(48) + "11" + "ff" + src + dst + h4(sport) + h4(dport) + h4(48) + "1234" + user_data()
+
+fn check(label: Str, dgx: Str, var t: ContextTable, want_header: Int)
+    test.case(label)
+    var d = load_dg(dgx)
+    var out: Vec[u8; 128] = Vec.new()
+    let r = lowiphc.compress(var d, d.len(), src_mac(), dst_mac(), var t, false, var out)
+    test.assert_eq(r.status, lowiphc.IPHC_OK)
+    test.assert_eq(r.header_len, want_header)
+    var f = out
+    for i in r.covered..d.len()
+        let _p = f.push(d[i])
+    var back: Vec[u8; 1280] = Vec.new()
+    let u = lowiphc.decompress(var f, 0, -1, src_mac(), dst_mac(), var t, var back)
+    test.assert_eq(u.status, lowiphc.IPHC_OK)
+    test.assert_eq_str(dg_hex(var back), dgx)
+
+@test
+fn test_zephyr_stateless_udp_cases_compress_to_the_sizes_zephyr_expects() [io]
+    var t = zephyr_contexts()
+    // test_data_1: TF 11 (0), SAM 00 (16), DAM 00 (16), ports 4-bit (1), checksum (2), IPHC 2, NHC 1.
+    check("test_data_1", udp_case(0x60, 0x00, 0x0000, src_sam00(), dst_dam00(), 0xF0B1, 0xF0B2), var t,
+          2 + 1 + 0 + 16 + 16 + 2 + 1)
+    // test_data_2: TF 01 (3), SAM 01 (8), DAM 01 (8), the source port 0xf011 compressible (P=10, 3).
+    check("test_data_2", udp_case(0x60, 0x20, 0x3412, src_sam01(), dst_dam01(), 0xF011, 0xF122), var t,
+          2 + 1 + 3 + 8 + 8 + 2 + 3)
+    // test_data_3: TF 01, SAM 10 (2), DAM 10 (2), the destination port 0xf022 compressible (P=01, 3).
+    check("test_data_3", udp_case(0x60, 0x21, 0x3412, src_sam10(), dst_dam10(), 0xF111, 0xF022), var t,
+          2 + 1 + 3 + 2 + 2 + 2 + 3)
+    // test_data_4: TF 10 (1), SAM 00 (16), a multicast destination with DAM 00 (16), ports in full (4).
+    check("test_data_4", udp_case(0x61, 0x20, 0x0000, src_sam00(), dst_m1_dam00(), 0xFF11, 0xFF22), var t,
+          2 + 1 + 1 + 16 + 16 + 2 + 4)
+    // test_data_5: TF 00 (4), SAM 01 (8), multicast DAM 01 (6), ports in full.
+    check("test_data_5", udp_case(0x61, 0x23, 0x4567, src_sam01(), dst_m1_dam01(), 0xFF11, 0xFF22), var t,
+          2 + 1 + 4 + 8 + 6 + 2 + 4)
+    // test_data_6: TF 11, SAM 10 (2), multicast DAM 10 (4), ports 0xf111 and 0xf122 in full.
+    check("test_data_6", udp_case(0x60, 0x00, 0x0000, src_sam10(), dst_m1_dam10(), 0xF111, 0xF122), var t,
+          2 + 1 + 0 + 2 + 4 + 2 + 4)
+    // The identifiers of both link addresses elided (SAM 11, DAM 11): 2 + 1 + 3 + 2 + 3.
+    check("SAM 11 and DAM 11 from the MAC addresses", udp_case(0x60, 0x21, 0x3412, src_sam11(), dst_dam11(), 0xF111, 0xF022),
+          var t, 2 + 1 + 3 + 0 + 0 + 2 + 3)
+    // A multicast destination ff02::11 with M=1 DAM 11 (1).
+    check("multicast DAM 11", udp_case(0x60, 0x00, 0x0000, src_sam11(), dst_m1_dam11(), 0xF111, 0xF122), var t,
+          2 + 1 + 0 + 0 + 1 + 2 + 4)
+
+@test
+fn test_zephyr_next_header_cases_that_are_not_udp() [io]
+    var t = zephyr_contexts()
+    // test_data_8: ICMPv6 (58), NHC 0 so the next header is in-line (1), SAM 10 (2), multicast DAM 10 (4).
+    let icmp = h2(0x60) + h2(0x00) + h4(0) + h4(4) + "3a" + "ff" + src_sam10() + dst_m1_dam10() + "80000000"
+    check("test_data_8, ICMPv6", icmp, var t, 2 + 1 + 0 + 2 + 4)
+    // test_data_14: no next header (59), the unspecified source with SAC=1 SAM 00 (0), multicast DAM 11 (1).
+    let none = h2(0x60) + h2(0x00) + h4(0) + h4(0) + "3b" + "ff" + src_sac1_sam00() + dst_m1_dam11()
+    check("test_data_14, ::", none, var t, 2 + 1 + 0 + 0 + 1)
+
+@test
+fn test_zephyr_context_cases_need_the_context_byte() [io]
+    var t = zephyr_contexts()
+    // test_data_15: context 1 on both addresses, SAM 01 and DAM 01 (8 and 8), TF 01, the source port compressible.
+    check("test_data_15", udp_case(0x60, 0x20, 0x3412, src_sac1_sam01(), dst_dac1_dam01(), 0xF011, 0xF122), var t,
+          2 + 1 + 3 + 1 + 8 + 8 + 2 + 3)
+    // test_data_16: context 2, SAM 10 (2) and DAM 10 (2).
+    check("test_data_16", udp_case(0x60, 0x21, 0x3412, src_sac1_sam10(), dst_dac1_dam10(), 0xF111, 0xF022), var t,
+          2 + 1 + 3 + 1 + 2 + 2 + 2 + 3)
+    // test_data_17: contexts 1 and 2 with the identifiers from the MAC addresses, SAM 11 and DAM 11.
+    check("test_data_17", udp_case(0x60, 0x21, 0x3412, src_sac1_sam11(), dst_dac1_dam11(), 0xF111, 0xF022), var t,
+          2 + 1 + 3 + 1 + 0 + 0 + 2 + 3)
+    // test_data_18: a stateless source and a context destination: CID still present.
+    check("test_data_18", udp_case(0x60, 0x20, 0x3412, src_sam01(), dst_dac1_dam01(), 0xF011, 0xF122), var t,
+          2 + 1 + 3 + 1 + 8 + 8 + 2 + 3)
+    // test_data_19: a context source and a stateless destination.
+    check("test_data_19", udp_case(0x60, 0x20, 0x3412, src_sac1_sam01(), dst_dam01(), 0xF011, 0xF122), var t,
+          2 + 1 + 3 + 1 + 8 + 8 + 2 + 3)
+    // test_data_20: TF 00, a context source and a multicast destination in full.
+    check("test_data_20", udp_case(0x61, 0x23, 0x4567, src_sac1_sam01(), dst_m1_dam00(), 0xFF11, 0xFF22), var t,
+          2 + 1 + 4 + 1 + 8 + 16 + 2 + 4)

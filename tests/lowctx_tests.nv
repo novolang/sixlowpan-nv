@@ -1,0 +1,119 @@
+// lowctx_tests.nv — the context table.
+//
+// A prefix of `len` bits covers the first `len` bits of an address.  Word `i`
+// of the address holds bits 32i to 32i+31, so a prefix of 48 bits covers all
+// of word 0 and the top 16 bits of word 1: masks 0xFFFFFFFF and 0xFFFF0000.
+//
+use std.test
+use lowpan
+use lowctx
+
+@test
+fn test_a_prefix_mask_covers_the_words_the_prefix_reaches() [io]
+    test.case("48 bits: word 0 whole, word 1 the top half, the rest nothing")
+    test.assert_eq(lowctx.prefix_mask(48, 0), 0xFFFFFFFF)
+    test.assert_eq(lowctx.prefix_mask(48, 1), 0xFFFF0000)
+    test.assert_eq(lowctx.prefix_mask(48, 2), 0)
+    test.assert_eq(lowctx.prefix_mask(48, 3), 0)
+    test.case("64 bits: two whole words")
+    test.assert_eq(lowctx.prefix_mask(64, 1), 0xFFFFFFFF)
+    test.assert_eq(lowctx.prefix_mask(64, 2), 0)
+    test.case("128 bits: all four words")
+    test.assert_eq(lowctx.prefix_mask(128, 3), 0xFFFFFFFF)
+    test.case("1 bit and 33 bits")
+    test.assert_eq(lowctx.prefix_mask(1, 0), 0x80000000)
+    test.assert_eq(lowctx.prefix_mask(33, 1), 0x80000000)
+    test.case("zero bits cover nothing")
+    test.assert_eq(lowctx.prefix_mask(0, 0), 0)
+
+@test
+fn test_a_context_is_set_cut_to_its_length_and_cleared() [io]
+    var t = lowctx.ctx_table()
+    test.case("a new table has sixteen contexts in none of which is in use")
+    test.assert_eq(t.len(), 16)
+    test.assert_eq(lowctx.ctx_get(var t, 0).valid, false)
+    test.assert_eq(lowctx.ctx_get(var t, 15).valid, false)
+    test.case("a prefix is cut to its length: 2001:db8:abcd:ef01::1 as a /48 is 2001:db8:abcd::")
+    test.assert_eq(lowctx.ctx_set(var t, 2, lowpan.ip6(0x20010DB8, 0xABCDEF01, 0, 1), 48, true), true)
+    let c = lowctx.ctx_get(var t, 2)
+    test.assert_eq(c.valid, true)
+    test.assert_eq(c.compress, true)
+    test.assert_eq(c.len, 48)
+    test.assert_eq(c.w0, 0x20010DB8)
+    test.assert_eq(c.w1, 0xABCD0000)
+    test.assert_eq(c.w2, 0)
+    test.assert_eq(c.w3, 0)
+    test.case("a /128 keeps the whole address")
+    test.assert_eq(lowctx.ctx_set(var t, 3, lowpan.ip6(1, 2, 3, 4), 128, false), true)
+    test.assert_eq(lowctx.ctx_get(var t, 3).w3, 4)
+    test.assert_eq(lowctx.ctx_get(var t, 3).compress, false)
+    test.case("a number or a length outside the range changes nothing")
+    test.assert_eq(lowctx.ctx_set(var t, 16, lowpan.ip6(1, 2, 3, 4), 64, true), false)
+    test.assert_eq(lowctx.ctx_set(var t, -1, lowpan.ip6(1, 2, 3, 4), 64, true), false)
+    test.assert_eq(lowctx.ctx_set(var t, 4, lowpan.ip6(1, 2, 3, 4), 0, true), false)
+    test.assert_eq(lowctx.ctx_set(var t, 4, lowpan.ip6(1, 2, 3, 4), 129, true), false)
+    test.assert_eq(lowctx.ctx_get(var t, 4).valid, false)
+    test.case("clearing takes a context out of use")
+    test.assert_eq(lowctx.ctx_clear(var t, 2), true)
+    test.assert_eq(lowctx.ctx_get(var t, 2).valid, false)
+    test.assert_eq(lowctx.ctx_clear(var t, 16), false)
+    test.assert_eq(lowctx.ctx_clear(var t, -1), false)
+    test.case("a number outside the table gives an unused context")
+    test.assert_eq(lowctx.ctx_get(var t, 16).valid, false)
+    test.assert_eq(lowctx.ctx_get(var t, -1).valid, false)
+
+@test
+fn test_the_longest_matching_context_that_may_compress_is_chosen() [io]
+    var t = lowctx.ctx_table()
+    let _a = lowctx.ctx_set(var t, 1, lowpan.ip6(0x20010DB8, 0, 0, 0), 32, true)
+    let _b = lowctx.ctx_set(var t, 2, lowpan.ip6(0x20010DB8, 0x00010000, 0, 0), 48, true)
+    let _c = lowctx.ctx_set(var t, 3, lowpan.ip6(0x20010DB8, 0x00010000, 0, 0), 48, true)
+    let _d = lowctx.ctx_set(var t, 4, lowpan.ip6(0x20010DB8, 0x00010000, 0x00020000, 0), 80, false)
+    test.case("an address in /48 and /32 takes the /48, and the lower number of two equals")
+    test.assert_eq(lowctx.ctx_find(var t, lowpan.ip6(0x20010DB8, 0x00010000, 0, 5)), 2)
+    test.case("an address in the /32 only takes the /32")
+    test.assert_eq(lowctx.ctx_find(var t, lowpan.ip6(0x20010DB8, 0x00020000, 0, 5)), 1)
+    test.case("a context with C clear is never chosen, though it is the longest")
+    test.assert_eq(lowctx.ctx_find(var t, lowpan.ip6(0x20010DB8, 0x00010000, 0x00020000, 5)), 2)
+    test.case("no match")
+    test.assert_eq(lowctx.ctx_find(var t, lowpan.ip6(0x20010DB9, 0, 0, 5)), -1)
+    test.case("a context that was cleared no longer matches")
+    let _e = lowctx.ctx_clear(var t, 1)
+    test.assert_eq(lowctx.ctx_find(var t, lowpan.ip6(0x20010DB8, 0x00020000, 0, 5)), -1)
+
+@test
+fn test_prefix_matching_compares_each_word_under_its_mask() [io]
+    var t = lowctx.ctx_table()
+    let _a = lowctx.ctx_set(var t, 0, lowpan.ip6(0x20010DB8, 0, 0x11110000, 0), 80, true)
+    let c = lowctx.ctx_get(var t, 0)
+    test.case("a match in every word")
+    test.assert_eq(lowctx.prefix_matches(c, lowpan.ip6(0x20010DB8, 0, 0x1111FFFF, 9)), true)
+    test.case("a difference in each covered word")
+    test.assert_eq(lowctx.prefix_matches(c, lowpan.ip6(0x20010DB9, 0, 0x11110000, 0)), false)
+    test.assert_eq(lowctx.prefix_matches(c, lowpan.ip6(0x20010DB8, 1, 0x11110000, 0)), false)
+    test.assert_eq(lowctx.prefix_matches(c, lowpan.ip6(0x20010DB8, 0, 0x11120000, 0)), false)
+    test.case("a difference in the word past the prefix does not matter")
+    test.assert_eq(lowctx.prefix_matches(c, lowpan.ip6(0x20010DB8, 0, 0x11110000, 0xFFFFFFFF)), true)
+    test.case("a context not in use matches nothing")
+    test.assert_eq(lowctx.prefix_matches(lowctx.ctx_get(var t, 1), lowpan.ip6(0, 0, 0, 0)), false)
+
+@test
+fn test_an_address_is_the_prefix_where_it_reaches_and_the_identifier_beyond() [io]
+    var t = lowctx.ctx_table()
+    test.case("a /64 takes both identifier words whole")
+    let _a = lowctx.ctx_set(var t, 0, lowpan.ip6(0x20010DB8, 0x00010002, 0, 0), 64, true)
+    let a = lowctx.with_prefix(lowctx.ctx_get(var t, 0), 0x11223344, 0x55667788)
+    test.assert_eq(a.w0, 0x20010DB8)
+    test.assert_eq(a.w1, 0x00010002)
+    test.assert_eq(a.w2, 0x11223344)
+    test.assert_eq(a.w3, 0x55667788)
+    test.case("a /112 keeps the context's bits in the identifier where it covers them")
+    let _b = lowctx.ctx_set(var t, 1, lowpan.ip6(0x20010DB8, 0, 0x00000000, 0xAAAA0000), 112, true)
+    let b = lowctx.with_prefix(lowctx.ctx_get(var t, 1), 0xFFFFFFFF, 0xFFFF1234)
+    test.assert_eq(b.w2, 0)
+    test.assert_eq(b.w3, 0xAAAA1234)
+    test.case("a /56 takes the context for the high byte of word 1 and the identifier's bits below are not used in the upper half")
+    let _c = lowctx.ctx_set(var t, 2, lowpan.ip6(0x20010DB8, 0x01000000, 0, 0), 56, true)
+    let c = lowctx.with_prefix(lowctx.ctx_get(var t, 2), 0xFFFFFFFF, 0xFFFFFFFF)
+    test.assert_eq(c.w1, 0x01000000)
+    test.assert_eq(c.w2, 0xFFFFFFFF)

@@ -1,0 +1,724 @@
+// lowiphc_tests.nv — LOWPAN_IPHC, RFC 6282, byte by byte.
+//
+// Every vector is a datagram, the link addresses and contexts it travels
+// with, and the compressed header it has to become.  The compressed bytes are
+// derived by hand from RFC 6282 section 3.1, and the derivation is in the
+// comment above each.  Each vector is also run backwards: the compressed
+// header and the datagram's payload are expanded again and must give the
+// datagram the vector began with.
+//
+// The first byte is 011 TF(2) NH HLIM(2) and the second CID SAC SAM(2) M DAC DAM(2).
+//
+//   TF   00 four bytes, 01 three, 10 one, 11 none
+//   HLIM 00 in-line, 01 is 1, 10 is 64, 11 is 255
+//   SAM  00 sixteen bytes, 01 eight, 10 two, 11 none (SAC=0); with SAC=1, 00 is ::
+//   DAM  as SAM; with M=1: 00 sixteen, 01 six, 10 four, 11 one
+//
+// The addresses are link-local ones built from short link addresses unless a
+// vector says otherwise.  A1 is fe80::ff:fe00:1 and A2 is fe80::ff:fe00:2, the
+// addresses of the short link addresses 0x0001 and 0x0002, so that both are
+// elided with SAM=11 and DAM=11.
+
+use std.test
+use std.bytes
+use lowpan
+use lowctx
+use lowiphc
+
+// ── helpers ─────────────────────────────────────────────────────────
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn load_dg(s: Str) -> Vec[u8; 1280]
+    var d: Vec[u8; 1280] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = d.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    d
+
+fn load_fr(s: Str) -> Vec[u8; 128]
+    var f: Vec[u8; 128] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = f.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    f
+
+fn dg_hex(var d: Vec[u8; 1280]) -> Str
+    var b = bytes.zeros(d.len())
+    for i in 0..d.len()
+        bytes.set_u8(b, i, d[i] as Int)
+    bytes.to_hex(b)
+
+fn fr_hex(var f: Vec[u8; 128]) -> Str
+    var b = bytes.zeros(f.len())
+    for i in 0..f.len()
+        bytes.set_u8(b, i, f[i] as Int)
+    bytes.to_hex(b)
+
+fn h2(n: Int) -> Str
+    bytes.to_hex(bytes.u8(n))
+
+fn h4(n: Int) -> Str
+    bytes.to_hex(bytes.u16_be(n))
+
+// An IPv6 header: traffic class, flow label, payload length, next header,
+// hop limit and two addresses of 32 hexadecimal digits.
+fn ip6hdr(tc: Int, flow: Int, plen: Int, nh: Int, hop: Int, src: Str, dst: Str) -> Str
+    h2(0x60 | (tc >> 4)) + h2(((tc & 15) << 4) | (flow >> 16)) + h4(flow & 0xFFFF) + h4(plen) + h2(nh) + h2(hop) + src + dst
+
+// fe80::ff:fe00:XXXX
+fn short_ll(x: Str) -> Str
+    "fe80000000000000000000fffe00" + x
+
+fn a1() -> Str
+    short_ll("0001")
+
+fn a2() -> Str
+    short_ll("0002")
+
+fn s1() -> LinkAddr
+    lowpan.ll_short(1)
+
+fn s2() -> LinkAddr
+    lowpan.ll_short(2)
+
+fn empty_table() -> ContextTable
+    lowctx.ctx_table()
+
+// Compress `dgx`, and expand the result again.
+fn vector(label: Str, dgx: Str, sll: LinkAddr, dll: LinkAddr, var t: ContextTable, elide: Bool,
+          want_hdr: Str, want_covered: Int)
+    test.case(label)
+    var d = load_dg(dgx)
+    let size = d.len()
+    var out: Vec[u8; 128] = Vec.new()
+    let r = lowiphc.compress(var d, size, sll, dll, var t, elide, var out)
+    test.assert_eq(r.status, lowiphc.IPHC_OK)
+    test.assert_eq_str(fr_hex(var out), want_hdr)
+    test.assert_eq(r.header_len, out.len())
+    test.assert_eq(r.covered, want_covered)
+    var f = out
+    for i in r.covered..size
+        let _p = f.push(d[i])
+    var back: Vec[u8; 1280] = Vec.new()
+    let u = lowiphc.decompress(var f, 0, -1, sll, dll, var t, var back)
+    test.assert_eq(u.status, lowiphc.IPHC_OK)
+    test.assert_eq(u.size, size)
+    test.assert_eq_str(dg_hex(var back), dgx)
+
+fn zeros(n: Int) -> Str
+    var s = ""
+    for _i in 0..n
+        s = s + "00"
+    s
+
+fn expand_status(frx: Str, sll: LinkAddr, dll: LinkAddr, var t: ContextTable) -> Int
+    var f = load_fr(frx)
+    var back: Vec[u8; 1280] = Vec.new()
+    lowiphc.decompress(var f, 0, -1, sll, dll, var t, var back).status
+
+// ── the base encoding ───────────────────────────────────────────────
+
+@test
+fn test_the_smallest_header_is_two_bytes_and_a_next_header() [io]
+    var t = empty_table()
+    // TF=11 (tc 0, flow 0), NH=0, HLIM=10 (64): 011 11 0 10 = 0x7a.
+    // SAC=0 SAM=11, M=0 DAC=0 DAM=11: 0 0 11 0 0 11 = 0x33.  Next header 58 = 0x3a in-line.
+    vector("hop limit 64, both addresses elided", ip6hdr(0, 0, 3, 58, 64, a1(), a2()) + "aabbcc", s1(), s2(),
+           var t, false, "7a333a", 40)
+    // HLIM=01 (1): 011 11 0 01 = 0x79.
+    vector("hop limit 1",
+        ip6hdr(0, 0, 3, 58, 1, a1(), a2()) + "aabbcc",
+        s1(),
+        s2(),
+        var t,
+        false,
+        "79333a",
+        40)
+    // HLIM=11 (255): 011 11 0 11 = 0x7b.
+    vector("hop limit 255",
+        ip6hdr(0, 0, 3, 58, 255, a1(), a2()) + "aabbcc",
+        s1(),
+        s2(),
+        var t,
+        false,
+        "7b333a",
+        40)
+    // HLIM=00: 0x78, the hop limit 17 follows the next header.
+    vector("hop limit 17 in-line", ip6hdr(0, 0, 3, 58, 17, a1(), a2()) + "aabbcc", s1(), s2(), var t, false,
+           "78333a11", 40)
+
+@test
+fn test_the_traffic_class_and_flow_label_take_four_forms() [io]
+    var t = empty_table()
+    // tc 0xb8 is ECN 0, DSCP 0x2e; flow 0.  TF=10: ECN and DSCP in one byte, ecn<<6 | dscp = 0x2e.
+    // b0 = 011 10 0 10 = 0x72.
+    vector("TF=10, flow label elided", ip6hdr(0xB8, 0, 3, 58, 64, a1(), a2()) + "aabbcc", s1(), s2(), var t, false,
+           "72332e3a", 40)
+    // tc 0x03 is ECN 3, DSCP 0; flow 0x12345.  TF=01: ecn<<6 | flow>>16 = 0xc1, then 0x23 0x45.
+    // b0 = 011 01 0 10 = 0x6a.
+    vector("TF=01, DSCP elided", ip6hdr(0x03, 0x12345, 3, 58, 64, a1(), a2()) + "aabbcc", s1(), s2(), var t, false,
+           "6a33c123453a", 40)
+    // tc 0xb9 is ECN 1, DSCP 0x2e; flow 0xabcde.  TF=00: 0x40|0x2e = 0x6e, 0x0a, 0xbc, 0xde.
+    // b0 = 011 00 0 10 = 0x62.
+    vector("TF=00, all in-line", ip6hdr(0xB9, 0xABCDE, 3, 58, 64, a1(), a2()) + "aabbcc", s1(), s2(), var t, false,
+           "62336e0abcde3a", 40)
+    // tc 0x04 is ECN 0, DSCP 1: the DSCP is not zero, so the three-byte form would lose it.  TF=00: 0x01, 0x01, 0x23, 0x45.
+    vector("a DSCP of one with a flow label", ip6hdr(0x04, 0x12345, 3, 58, 64, a1(), a2()) + "aabbcc", s1(), s2(), var t,
+           false, "623301012345" + "3a", 40)
+    // The same traffic class without a flow label: TF=10, one byte 0x01.
+    vector("a DSCP of one alone", ip6hdr(0x04, 0, 3, 58, 64, a1(), a2()) + "aabbcc", s1(), s2(), var t, false,
+           "723301" + "3a", 40)
+    // tc 0 with a flow label: DSCP is zero, so TF=01 with ECN 0: 0x01 0x23 0x45.
+    vector("a flow label alone", ip6hdr(0, 0x12345, 3, 58, 64, a1(), a2()) + "aabbcc", s1(), s2(), var t, false,
+           "6a33" + "0123453a", 40)
+
+// ── stateless addresses ─────────────────────────────────────────────
+
+@test
+fn test_a_source_address_is_in_line_in_sixteen_eight_two_or_no_bytes() [io]
+    var t = empty_table()
+    let global = "20010db8000000000000000000000001"
+    // SAM=00: sixteen bytes in-line.  b1 = 0 0 00 0 0 11 = 0x03.
+    vector("SAM=00, a global address", ip6hdr(0, 0, 3, 58, 64, global, a2()) + "aabbcc", s1(), s2(), var t, false,
+           "7a033a" + global, 40)
+    // fe80::1 is link-local but its identifier is neither the link's nor 0000:00ff:fe00:XXXX: SAM=01.
+    // b1 = 0 0 01 0 0 11 = 0x13, eight bytes in-line.
+    vector("SAM=01, a link-local address", ip6hdr(0, 0, 3, 58, 64, "fe800000000000000000000000000001", a2()) + "aabbcc",
+           s1(), s2(), var t, false, "7a133a0000000000000001", 40)
+    // fe80::ff:fe00:aabb is not the link's own but has the short form: SAM=10.  b1 = 0x23.
+    vector("SAM=10, a short-form identifier", ip6hdr(0, 0, 3, 58, 64, short_ll("aabb"), a2()) + "aabbcc", s1(), s2(),
+           var t, false, "7a233a" + "aabb", 40)
+    // The identifier of an extended address 00:11:22:33:44:55:66:77 is 0211:2233:4455:6677: SAM=11.
+    vector("SAM=11, from an extended link address", ip6hdr(0, 0, 3, 58, 64, "fe800000000000000211223344556677", a2()) + "aabbcc",
+           lowpan.ll_extended(0x00112233, 0x44556677), s2(), var t, false, "7a333a", 40)
+    // The same address with a short link address has no match: SAM=01.
+    vector("the same identifier without the extended link address",
+           ip6hdr(0, 0, 3, 58, 64, "fe800000000000000211223344556677", a2()) + "aabbcc", s1(), s2(), var t, false,
+           "7a133a0211223344556677", 40)
+    // :: with SAC=1 SAM=00 is elided altogether.  b1 = 0 1 00 0 0 11 = 0x43.
+    vector("the unspecified address", ip6hdr(0, 0, 3, 58, 64, "00000000000000000000000000000000", a2()) + "aabbcc", s1(),
+           s2(), var t, false, "7a433a", 40)
+    // An address that would be elided if the link address were known, with none: SAM=01 (the link-local form).
+    vector("no link address means the identifier travels", ip6hdr(0, 0, 3, 58, 64, a1(), a2()) + "aabbcc",
+           lowpan.ll_none(), s2(), var t, false, "7a233a0001", 40)
+
+@test
+fn test_a_unicast_destination_is_in_line_in_sixteen_eight_two_or_no_bytes() [io]
+    var t = empty_table()
+    let global = "20010db8000000000000000000000002"
+    // DAM=00: b1 = 0 0 11 0 0 00 = 0x30.
+    vector("DAM=00",
+        ip6hdr(0, 0, 3, 58, 64, a1(), global) + "aabbcc",
+        s1(),
+        s2(),
+        var t,
+        false,
+        "7a303a" + global,
+        40)
+    // DAM=01: 0x31.
+    vector("DAM=01", ip6hdr(0, 0, 3, 58, 64, a1(), "fe800000000000000000000000000002") + "aabbcc", s1(), s2(), var t, false,
+           "7a313a0000000000000002", 40)
+    // DAM=10: 0x32.
+    vector("DAM=10", ip6hdr(0, 0, 3, 58, 64, a1(), short_ll("0005")) + "aabbcc", s1(), s2(), var t, false,
+           "7a323a0005", 40)
+    // DAM=11 needs the destination's link address.
+    vector("DAM=11 from the extended address of the destination",
+           ip6hdr(0, 0, 3, 58, 64, a1(), "fe800000000000000211223344556677") + "aabbcc", s1(),
+           lowpan.ll_extended(0x00112233, 0x44556677), var t, false, "7a333a", 40)
+
+@test
+fn test_a_multicast_destination_takes_sixteen_six_four_or_one_byte() [io]
+    var t = empty_table()
+    // ff02::1 is ff02::00XX with XX = 01: M=1 DAM=11.  b1 = 0 0 11 1 0 11 = 0x3b, one byte in-line.
+    vector("ff02::1, DAM=11", ip6hdr(0, 0, 3, 58, 64, a1(), "ff020000000000000000000000000001") + "aabbcc", s1(), s2(),
+           var t, false, "7a3b3a01", 40)
+    // ff02::ff is the largest group that ff02::00XX holds: DAM=11, one byte ff.
+    vector("ff02::ff, DAM=11", ip6hdr(0, 0, 3, 58, 64, a1(), "ff0200000000000000000000000000ff") + "aabbcc", s1(), s2(),
+           var t, false, "7a3b3aff", 40)
+    // ff02::100 does not fit one byte: it has the 32-bit form, ff02::00XX:XXXX with 02 00 01 00: DAM=10.
+    vector("ff02::100, DAM=10", ip6hdr(0, 0, 3, 58, 64, a1(), "ff020000000000000000000000000100") + "aabbcc", s1(), s2(),
+           var t, false, "7a3a3a02000100", 40)
+    // ff05::1:3 is ffXX::00XX:XXXX with XX = 05, 01 00 03: DAM=10.  b1 = 0x3a, four bytes: 05 01 00 03.
+    vector("ff05::1:3, DAM=10", ip6hdr(0, 0, 3, 58, 64, a1(), "ff050000000000000000000000010003") + "aabbcc", s1(), s2(),
+           var t, false, "7a3a3a05010003", 40)
+    // The solicited-node address ff02::1:ff00:1 is ffXX::00XX:XXXX:XXXX with 02, 01 ff 00 00 01: DAM=01.
+    // b1 = 0x39, six bytes.
+    vector("ff02::1:ff00:1, DAM=01", ip6hdr(0, 0, 3, 58, 64, a1(), "ff0200000000000000000001ff000001") + "aabbcc", s1(),
+           s2(), var t, false, "7a393a0201ff000001", 40)
+    // ff02::ff00:1: the word before the low half is zero but the next byte is not, so DAM=01 with a zero 00 byte.
+    vector("ff02::ff00:1, DAM=01", ip6hdr(0, 0, 3, 58, 64, a1(), "ff0200000000000000000000ff000001") + "aabbcc", s1(),
+           s2(), var t, false, "7a393a0200ff000001", 40)
+    // ff0e:0:0:0:0:1234:5678:9abc takes none of the short forms: DAM=00.  b1 = 0x38.
+    vector("a group that fits no short form, DAM=00",
+           ip6hdr(0, 0, 3, 58, 64, a1(), "ff0e0000000000000000123456789abc") + "aabbcc", s1(), s2(),
+           var t, false, "7a383a" + "ff0e00000000000000001234" + "56789abc", 40)
+    // ff02:1::1: the second group is not zero.
+    vector("ff02:1::1, DAM=00", ip6hdr(0, 0, 3, 58, 64, a1(), "ff020001000000000000000000000001") + "aabbcc", s1(), s2(),
+           var t, false, "7a383a" + "ff020001000000000000000000000001", 40)
+
+// ── contexts ────────────────────────────────────────────────────────
+
+fn contexts() -> ContextTable
+    var t = lowctx.ctx_table()
+    let _a = lowctx.ctx_set(var t, 0, lowpan.ip6(0x20010DB8, 0x00000001, 0, 0), 64, true)
+    let _b = lowctx.ctx_set(var t, 3, lowpan.ip6(0x20010DB8, 0x00000003, 0, 0), 64, true)
+    let _c = lowctx.ctx_set(var t, 4, lowpan.ip6(0x20010DB8, 0, 0, 0), 64, true)
+    let _d = lowctx.ctx_set(var t, 5, lowpan.ip6(0x20010DB8, 0x00000005, 0, 0), 64, true)
+    let _e = lowctx.ctx_set(var t, 7, lowpan.ip6(0x20010DB8, 0x00000007, 0, 0), 64, false)
+    let _f = lowctx.ctx_set(var t, 2, lowpan.ip6(0x20010DB8, 0, 0, 0), 112, true)
+    t
+
+@test
+fn test_a_context_elides_the_prefix_of_a_source_address() [io]
+    var t = contexts()
+    // Context 0, SAC=1 SAM=11: 2001:db8:0:1:0211:2233:4455:6677 from the extended link address.
+    // CID=0.  b1 = 0 1 11 0 0 11 = 0x73.
+    vector("SAC=1, SAM=11 with context 0", ip6hdr(0, 0, 3, 58, 64, "20010db8000000010211223344556677", a2()) + "aabbcc",
+           lowpan.ll_extended(0x00112233, 0x44556677), s2(), var t, false, "7a733a", 40)
+    // Context 5, SAM=01: the context number needs the CID byte, 0x50 (source 5, destination 0).
+    // b1 = 1 1 01 0 0 11 = 0xd3.
+    vector("SAC=1, SAM=01 with context 5", ip6hdr(0, 0, 3, 58, 64, "20010db8000000050000000000000001", a2()) + "aabbcc",
+           lowpan.ll_short(9), s2(), var t, false, "7ad3503a0000000000000001", 40)
+    // Context 2 is a /112: 2001:db8::1234 keeps 112 bits in the context and 16 bits in-line, SAM=10.
+    // CID byte 0x20, b1 = 1 1 10 0 0 11 = 0xe3.
+    vector("a context longer than 64 bits, SAM=10", ip6hdr(0, 0, 3, 58, 64, "20010db8000000000000000000001234", a2()) + "aabbcc",
+           lowpan.ll_short(9), s2(), var t, false, "7ae3203a1234", 40)
+
+@test
+fn test_a_context_elides_the_prefix_of_a_destination_address() [io]
+    var t = contexts()
+    // Context 3, DAC=1 DAM=01, the source elided.  CID byte 0x03.  b1 = 1 0 11 0 1 01 = 0xb5.
+    vector("DAC=1, DAM=01 with context 3", ip6hdr(0, 0, 3, 58, 64, a1(), "20010db80000000300000000000000aa") + "aabbcc",
+           s1(), lowpan.ll_none(), var t, false, "7ab5033a00000000000000aa", 40)
+    // Source context 5 with the identifier from the link, destination context 3 with a short form.
+    // CID byte 0x53.  b1 = 1 1 11 0 1 10 = 0xf6.  The destination's 16 bits are 00bb.
+    vector("two contexts, SAM=11 and DAM=10",
+           ip6hdr(0, 0, 3, 58, 64, "20010db800000005000000fffe000001", "20010db800000003000000fffe0000bb") + "aabbcc",
+           s1(), s2(), var t, false, "7af6533a00bb", 40)
+
+@test
+fn test_a_stateful_multicast_destination_carries_six_bytes() [io]
+    var t = contexts()
+    // ff3e:40:2001:db8::1: unicast-prefix-based, flags/scope 3e, RIID 00, prefix length 0x40 = 64,
+    // the prefix 2001:db8:0:0 from context 4, group 00000001.  M=1 DAC=1 DAM=00; CID byte 0x04.
+    // b1 = 1 0 11 1 1 00 = 0xbc.  In-line: 3e 00 00 00 00 01.
+    vector("RFC 3306 group, M=1 DAC=1", ip6hdr(0, 0, 3, 58, 64, a1(), "ff3e004020010db80000000000000001") + "aabbcc",
+           s1(), s2(), var t, false, "7abc043a3e0000000001", 40)
+
+@test
+fn test_a_context_that_may_not_compress_is_still_used_to_expand() [io]
+    var t = contexts()
+    // Context 7 has C clear: a source 2001:db8:0:7::1 goes out in full.  b1 = 0x03.
+    vector("C clear: not used to compress", ip6hdr(0, 0, 3, 58, 64, "20010db8000000070000000000000001", a2()) + "aabbcc",
+           s1(), s2(), var t, false, "7a033a" + "20010db8000000070000000000000001", 40)
+    // The same address arriving compressed with context 7 expands: CID byte 0x70, SAM=01, b1 = 0xd3.
+    test.case("C clear: still used to expand")
+    var f = load_fr("7ad3703a0000000000000001aabbcc")
+    var d: Vec[u8; 1280] = Vec.new()
+    let u = lowiphc.decompress(var f, 0, -1, s1(), s2(), var t, var d)
+    test.assert_eq(u.status, lowiphc.IPHC_OK)
+    test.assert_eq_str(dg_hex(var d), ip6hdr(0, 0, 3, 58, 64, "20010db8000000070000000000000001", a2()) + "aabbcc")
+
+@test
+fn test_a_context_that_is_not_in_use_is_refused() [io]
+    var t = contexts()
+    test.case("source context 9, SAM=01")
+    test.assert_eq(expand_status("7ad3903a0000000000000001aabbcc", s1(), s2(), var t), lowiphc.IPHC_E_CONTEXT)
+    test.case("source context 9, SAM=11 (DAM=11)")
+    test.assert_eq(expand_status("7af3903a", s1(), s2(), var t), lowiphc.IPHC_E_CONTEXT)
+    test.case("destination context 9, DAM=01: b1 = 1 0 11 0 1 01 = 0xb5")
+    test.assert_eq(expand_status("7ab5093a0000000000000001aabbcc", s1(), s2(), var t), lowiphc.IPHC_E_CONTEXT)
+    test.case("stateful multicast with context 9: b1 = 0xbc")
+    test.assert_eq(expand_status("7abc093a3e0000000001", s1(), s2(), var t), lowiphc.IPHC_E_CONTEXT)
+    test.case("source :: needs no context even when context 9 is named: b1 = 1 1 00 0 0 11 = 0xc3")
+    test.assert_eq(expand_status("7ac3903a", s1(), s2(), var t), lowiphc.IPHC_OK)
+
+@test
+fn test_reserved_modes_and_missing_link_addresses_are_refused() [io]
+    var t = contexts()
+    test.case("DAC=1 with M=0 and DAM=00 is reserved: b1 = 0 0 11 0 1 00 = 0x34")
+    test.assert_eq(expand_status("7a343a", s1(), s2(), var t), lowiphc.IPHC_E_RESERVED)
+    test.case("M=1 DAC=1 with DAM=01 is reserved: b1 = 0x3d")
+    test.assert_eq(expand_status("7a3d3a", s1(), s2(), var t), lowiphc.IPHC_E_RESERVED)
+    test.case("SAM=11 needs a link address for the source")
+    test.assert_eq(expand_status("7a333a", lowpan.ll_none(), s2(), var t), lowiphc.IPHC_E_LINK)
+    test.case("DAM=11 needs one for the destination")
+    test.assert_eq(expand_status("7a333a", s1(), lowpan.ll_none(), var t), lowiphc.IPHC_E_LINK)
+
+// ── truncated input ─────────────────────────────────────────────────
+
+@test
+fn test_every_strict_prefix_of_a_compressed_header_is_refused() [io]
+    var t = contexts()
+    // CID=1 with source context 5 and destination context 3, TF=00, NH=1, HLIM in-line, SAM=01, DAM=01 with
+    // a UDP header with its ports in-line.  b0 = 011 00 1 00 = 0x64, b1 = 1 1 01 0 1 01 = 0xd5, CID 0x53.
+    let full = "64d553" + "6e0abcde" + "40" + "0000000000000001" + "0000000000000002" + "f0" + "16331634" + "abcd"
+    test.case("the whole header is read")
+    test.assert_eq(expand_status(full, s1(), s2(), var t), lowiphc.IPHC_OK)
+    test.case("every shorter prefix is a short frame, whichever field it stops in")
+    var short = 0
+    var n = 0
+    let raw = h(full)
+    for cut in 0..bytes.len(raw)
+        n = n + 1
+        if expand_status(bytes.to_hex(bytes.slice(raw, 0, cut)), s1(), s2(), var t) == lowiphc.IPHC_E_SHORT
+            short = short + 1
+    test.assert_eq(short, n)
+
+@test
+fn test_every_strict_prefix_of_a_header_with_extension_headers_is_refused() [io]
+    var t = empty_table()
+    // HbH with N=1, a UDP header with P=01 and the checksum in-line.
+    let full = "7e33" + "e1" + "06" + "010400000000" + "f1" + "1633" + "b1" + "abcd"
+    test.assert_eq(expand_status(full, s1(), s2(), var t), lowiphc.IPHC_OK)
+    var short = 0
+    var n = 0
+    let raw = h(full)
+    for cut in 0..bytes.len(raw)
+        n = n + 1
+        if expand_status(bytes.to_hex(bytes.slice(raw, 0, cut)), s1(), s2(), var t) == lowiphc.IPHC_E_SHORT
+            short = short + 1
+    test.assert_eq(short, n)
+    // P=10 and P=11 cut short, and an inline next header and length byte missing.
+    test.assert_eq(expand_status("7e33f2b1", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+    test.assert_eq(expand_status("7e33f3", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+    test.assert_eq(expand_status("7e33e0", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+    test.assert_eq(expand_status("7e33e011", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+    test.assert_eq(expand_status("7e33e0110601", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+
+@test
+fn test_a_first_byte_that_is_not_iphc_is_refused() [io]
+    var t = empty_table()
+    test.case("010... is not 011...")
+    test.assert_eq(expand_status("5a333a", s1(), s2(), var t), lowiphc.IPHC_E_BAD)
+    test.case("an empty frame")
+    test.assert_eq(expand_status("", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+    test.case("one byte")
+    test.assert_eq(expand_status("7a", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+
+// ── the next header encodings ───────────────────────────────────────
+
+fn udp_dg(sport: Int, dport: Int, payload: Str, checksum: Str) -> Str
+    let plen = 8 + bytes.len(h(payload))
+    ip6hdr(0, 0, plen, 17, 64, a1(), a2()) + h4(sport) + h4(dport) + h4(plen) + checksum + payload
+
+@test
+fn test_udp_ports_take_one_of_four_forms() [io]
+    var t = empty_table()
+    // b0 = 011 11 1 10 = 0x7e (NH=1), b1 = 0x33.  The UDP encoding is 11110 C PP, C=0 here.
+    // P=11: both ports 0xf0bX, one byte (src low nibble << 4 | dst low nibble): f3 12.
+    vector("P=11, 0xf0b1 and 0xf0b2", udp_dg(0xF0B1, 0xF0B2, "4142", "abcd"), s1(), s2(), var t, false,
+           "7e33f312abcd", 48)
+    // P=01: the destination is 0xf0XX; the source in full, the destination's low byte: f1 1633 b1.
+    vector("P=01, the destination 0xf0b1", udp_dg(0x1633, 0xF0B1, "4142", "abcd"), s1(), s2(), var t, false,
+           "7e33f11633b1abcd", 48)
+    // P=10: the source is 0xf0XX; its low byte, then the destination in full: f2 b1 1633.
+    vector("P=10, the source 0xf0b1", udp_dg(0xF0B1, 0x1633, "4142", "abcd"), s1(), s2(), var t, false,
+           "7e33f2b11633abcd", 48)
+    // Both start with 0xf0 but not 0xf0b: the destination is chosen, f1 f011 22.
+    vector("both 0xf0XX, not 0xf0bX", udp_dg(0xF011, 0xF022, "4142", "abcd"), s1(), s2(), var t, false,
+           "7e33f1f01122abcd", 48)
+    // P=00: neither port starts with 0xf0: f0 f111 f122.
+    vector("P=00",
+        udp_dg(0xF111, 0xF122, "4142", "abcd"),
+        s1(),
+        s2(),
+        var t,
+        false,
+        "7e33f0f111f122abcd",
+        48)
+    // 0xf0b0 and 0xf0bf are the ends of the 4-bit range, 0xf0af and 0xf0c0 are outside it.
+    vector("the ends of the 4-bit range", udp_dg(0xF0B0, 0xF0BF, "4142", "abcd"), s1(), s2(), var t, false,
+           "7e33f30fabcd", 48)
+    vector("just outside the 4-bit range", udp_dg(0xF0AF, 0xF0C0, "4142", "abcd"), s1(), s2(), var t, false,
+           "7e33f1f0af" + "c0abcd", 48)
+
+// The UDP checksum of a datagram computed with a plain loop over its bytes,
+// for an IPv6 header at 0 and a UDP header at 40.
+fn naive_checksum(dgx: Str) -> Int
+    let raw = h(dgx)
+    let n = bytes.len(raw)
+    let udp_len = n - 40
+    var sum = 0
+    for i in 0..16
+        sum = sum + ((bytes.byte_at(raw, 8 + 2 * i) ?? 0) << 8) + (bytes.byte_at(raw, 9 + 2 * i) ?? 0)
+    sum = sum + udp_len + 17
+    for i in 0..udp_len / 2
+        if i != 3
+            sum = sum + ((bytes.byte_at(raw, 40 + 2 * i) ?? 0) << 8) + (bytes.byte_at(raw, 41 + 2 * i) ?? 0)
+    if (udp_len & 1) == 1
+        sum = sum + ((bytes.byte_at(raw, n - 1) ?? 0) << 8)
+    for _k in 0..3
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    0xFFFF - sum
+
+fn udp_with_checksum(sport: Int, dport: Int, payload: Str) -> Str
+    let zero = udp_dg(sport, dport, payload, "0000")
+    udp_dg(sport, dport, payload, h4(naive_checksum(zero)))
+
+@test
+fn test_the_udp_checksum_is_elided_only_when_the_caller_allows_it_and_it_is_right() [io]
+    var t = empty_table()
+    let dgx = udp_with_checksum(0x1633, 0x1634, "4142")
+    // C=1 P=00: 11110 1 00 = 0xf4; ports in full, no checksum.  The expander puts it back.
+    vector("C=1, P=00", dgx, s1(), s2(), var t, true, "7e33f416331634", 48)
+    // C=1 P=11: 0xf7 and one byte.
+    vector("C=1, P=11",
+        udp_with_checksum(0xF0B1, 0xF0B2, "4142"),
+        s1(),
+        s2(),
+        var t,
+        true,
+        "7e33f712",
+        48)
+    test.case("not authorised: the checksum stays in-line")
+    var d = load_dg(dgx)
+    var out: Vec[u8; 128] = Vec.new()
+    let r = lowiphc.compress(var d, d.len(), s1(), s2(), var t, false, var out)
+    test.assert_eq(r.status, lowiphc.IPHC_OK)
+    test.assert_eq(out.len(), 7 + 2)
+    test.case("authorised but wrong: refused and nothing is elided")
+    d[46] = 0x00
+    d[47] = 0x01
+    let bad = lowiphc.compress(var d, d.len(), s1(), s2(), var t, true, var out)
+    test.assert_eq(bad.status, lowiphc.IPHC_E_CHECKSUM)
+    test.case("an odd payload length")
+    vector("C=1 with a 3-byte payload", udp_with_checksum(0x1633, 0x1634, "414243"), s1(), s2(), var t, true,
+           "7e33f416331634", 48)
+
+@test
+fn test_an_elided_checksum_waits_for_the_rest_of_a_fragmented_datagram() [io]
+    var t = empty_table()
+    // The whole datagram is 48 + 20 bytes; the first fragment holds the 48 bytes of headers and 8 of payload.
+    let payload = "000102030405060708090a0b0c0d0e0f10111213"
+    let dgx = udp_with_checksum(0x1633, 0x1634, payload)
+    var f = load_fr("7e33f416331634" + "0001020304050607")
+    var d: Vec[u8; 1280] = Vec.new()
+    let u = lowiphc.decompress(var f, 0, 68, s1(), s2(), var t, var d)
+    test.assert_eq(u.status, lowiphc.IPHC_OK)
+    test.assert_eq(u.size, 68)
+    test.assert_eq(u.written, 56)
+    test.assert_eq(u.udp_off, 40)
+    test.assert_eq(u.pending, true)
+    test.case("the length fields are filled in from the datagram's size")
+    test.assert_eq(d[4] as Int, 0)
+    test.assert_eq(d[5] as Int, 28)
+    test.assert_eq(d[44] as Int, 0)
+    test.assert_eq(d[45] as Int, 28)
+    test.case("the rest of the datagram arrives and the checksum is put back")
+    let rest = h(payload)
+    for i in 8..20
+        let _p = d.push((bytes.byte_at(rest, i) ?? 0) as u8)
+    test.assert_eq(lowiphc.restore_checksum(var d, 68, 40), true)
+    test.assert_eq_str(dg_hex(var d), dgx)
+    test.case("a restore with no UDP header, or a size past the buffer, does nothing")
+    test.assert_eq(lowiphc.restore_checksum(var d, 68, -1), false)
+    test.assert_eq(lowiphc.restore_checksum(var d, 44, 40), false)
+    test.assert_eq(lowiphc.restore_checksum(var d, 2000, 40), false)
+
+// ── extension headers ───────────────────────────────────────────────
+
+// A Hop-by-Hop header of 8 bytes: next header, 0, and a PadN of 4 bytes.
+fn hbh(next: Int) -> Str
+    h2(next) + "00" + "010400000000"
+
+@test
+fn test_an_extension_header_followed_by_udp_is_compressed_in_two_steps() [io]
+    var t = empty_table()
+    // HbH (nh 0) then UDP: the IPv6 header's next header is elided (NH=1), b0 = 0x7e.
+    // NHC for the Hop-by-Hop header, EID 0, N=1 because UDP follows: 1110 000 1 = 0xe1.
+    // Its length byte is the 6 bytes after the length field; its next header is elided; then 6 bytes.
+    // The UDP header with P=11 and the checksum in-line: f3 12 1234.
+    let dgx = ip6hdr(0, 0, 16, 0, 64, a1(), a2()) + hbh(17) + "f0b1f0b2" + "0008" + "1234"
+    vector("Hop-by-Hop and UDP", dgx, s1(), s2(), var t, false, "7e33e106010400000000f3121234", 56)
+
+@test
+fn test_an_extension_header_followed_by_something_else_keeps_its_next_header() [io]
+    var t = empty_table()
+    // Routing (43), EID 1, followed by TCP (6) which has no encoding: N=0, so the next header 06 is in-line.
+    // 1110 001 0 = 0xe2, next header 06, length 06, then the 6 bytes.
+    let route = "06" + "00" + "020100000000"
+    vector("Routing then TCP", ip6hdr(0, 0, 10, 43, 64, a1(), a2()) + route + "aabb", s1(), s2(), var t, false,
+           "7e33e20606020100000000", 48)
+    // Destination Options (60), EID 3: 1110 011 0 = 0xe6.
+    let dst = "06" + "00" + "010400000000"
+    vector("Destination Options then TCP", ip6hdr(0, 0, 10, 60, 64, a1(), a2()) + dst + "aabb", s1(), s2(), var t, false,
+           "7e33e60606010400000000", 48)
+    // Mobility (135), EID 4: 1110 100 0 = 0xe8, next header 59 (3b), then a Mobility header body.
+    let mob = "3b" + "00" + "040000000000"
+    vector("Mobility then no next header", ip6hdr(0, 0, 10, 135, 64, a1(), a2()) + mob + "aabb", s1(), s2(), var t, false,
+           "7e33e83b06040000000000", 48)
+
+@test
+fn test_extension_headers_chain_to_udp() [io]
+    var t = empty_table()
+    // HbH (nh 60) -> Destination Options (nh 17) -> UDP.  HbH: 1110 000 1 = 0xe1; Destination Options:
+    // 1110 011 1 = 0xe7; UDP f3 12 with a checksum.
+    let dgx = ip6hdr(0, 0, 24, 0, 64, a1(), a2()) + hbh(60) + "11" + "00" + "010400000000" + "f0b1f0b2" + "0008" + "5678"
+    vector("Hop-by-Hop, Destination Options, UDP", dgx, s1(), s2(), var t, false,
+           "7e33e106010400000000" + "e706010400000000" + "f3125678", 64)
+    // A header of 24 bytes (hdrextlen 2) has a length byte of 22.
+    let long = "11" + "02" + "010400000000" + "0102030405060708" + "0102030405060708"
+    vector("a 24-byte header", ip6hdr(0, 0, 32, 0, 64, a1(), a2()) + long + "f0b1f0b2" + "0008" + "1234", s1(), s2(),
+           var t, false, "7e33e116" + "010400000000" + "0102030405060708" + "0102030405060708" + "f3121234", 72)
+
+@test
+fn test_an_extension_header_too_long_to_encode_is_left_uncompressed() [io]
+    var t = empty_table()
+    // hdrextlen 32 is 264 bytes: the length byte would be 262.  The IPv6 header keeps its next header (NH=0).
+    var long = "06" + "20"
+    for _i in 0..131
+        long = long + "0101"
+    let dgx = ip6hdr(0, 0, 264 + 2, 0, 64, a1(), a2()) + long + "aabb"
+    test.case("hdrextlen 32 is not compressed")
+    var d = load_dg(dgx)
+    var out: Vec[u8; 128] = Vec.new()
+    let r = lowiphc.compress(var d, d.len(), s1(), s2(), var t, false, var out)
+    test.assert_eq(r.status, lowiphc.IPHC_OK)
+    test.assert_eq_str(fr_hex(var out), "7a3300")
+    test.assert_eq(r.covered, 40)
+    test.case("an extension header that runs past the datagram is not compressed either")
+    let cut = ip6hdr(0, 0, 4, 0, 64, a1(), a2()) + "0600" + "0104"
+    var c = load_dg(cut)
+    let r2 = lowiphc.compress(var c, c.len(), s1(), s2(), var t, false, var out)
+    test.assert_eq_str(fr_hex(var out), "7a3300")
+    test.assert_eq(r2.covered, 40)
+    test.case("a header that is shorter than its own two bytes")
+    let tiny = ip6hdr(0, 0, 1, 0, 64, a1(), a2()) + "06"
+    var tn = load_dg(tiny)
+    let r3 = lowiphc.compress(var tn, tn.len(), s1(), s2(), var t, false, var out)
+    test.assert_eq_str(fr_hex(var out), "7a3300")
+    test.assert_eq(r3.covered, 40)
+
+@test
+fn test_a_header_that_does_not_fit_the_frame_is_refused() [io]
+    var t = empty_table()
+    // A Hop-by-Hop header of 128 bytes (hdrextlen 15) compresses to 130 bytes plus the IPHC.
+    var body = "11" + "0f"
+    for _i in 0..63
+        body = body + "0101"
+    let dgx = ip6hdr(0, 0, 136, 0, 64, a1(), a2()) + body + "f0b1f0b2" + "0008" + "1234"
+    var d = load_dg(dgx)
+    var out: Vec[u8; 128] = Vec.new()
+    let r = lowiphc.compress(var d, d.len(), s1(), s2(), var t, false, var out)
+    test.assert_eq(r.status, lowiphc.IPHC_E_NOSPACE)
+
+@test
+fn test_trailing_padding_of_an_expanded_header_is_restored() [io]
+    var t = empty_table()
+    // A Hop-by-Hop NHC with N=0, next header 06, length 3 and three option bytes 05 02 00 (Router Alert
+    // starts 05 02 and takes two bytes: 05 02 00 00; here only 3 bytes arrive).  2 + 3 = 5 bytes, so the
+    // expander pads to 8 with a PadN of 3 bytes: 01 01 00.  hdrextlen = 8/8 - 1 = 0.
+    var f = load_fr("7e33" + "e0" + "06" + "03" + "050200" + "aabb")
+    var d: Vec[u8; 1280] = Vec.new()
+    let u = lowiphc.decompress(var f, 0, -1, s1(), s2(), var t, var d)
+    test.assert_eq(u.status, lowiphc.IPHC_OK)
+    test.assert_eq_str(dg_hex(var d), ip6hdr(0, 0, 10, 0, 64, a1(), a2()) + "0600" + "050200" + "010100" + "aabb")
+    // 2 + 5 = 7 bytes: one byte of padding, a Pad1 (a single zero).
+    var g = load_fr("7e33" + "e6" + "06" + "05" + "0102030405" + "aabb")
+    var e: Vec[u8; 1280] = Vec.new()
+    let v = lowiphc.decompress(var g, 0, -1, s1(), s2(), var t, var e)
+    test.assert_eq(v.status, lowiphc.IPHC_OK)
+    test.assert_eq_str(dg_hex(var e),
+        ip6hdr(0, 0, 10, 60, 64, a1(), a2()) + "0600" + "0102030405" + "00" + "aabb" + "")
+    // 2 + 6 = 8 bytes: no padding.
+    var k = load_fr("7e33" + "e0" + "06" + "06" + "010400000000")
+    var j: Vec[u8; 1280] = Vec.new()
+    let w = lowiphc.decompress(var k, 0, -1, s1(), s2(), var t, var j)
+    test.assert_eq(w.status, lowiphc.IPHC_OK)
+    test.assert_eq_str(dg_hex(var j), ip6hdr(0, 0, 8, 0, 64, a1(), a2()) + "0600" + "010400000000")
+
+@test
+fn test_encodings_this_package_does_not_have_are_refused_by_name() [io]
+    var t = empty_table()
+    test.case("EID 2, the Fragment header: 1110 010 0 = 0xe4")
+    test.assert_eq(expand_status("7e33e406", s1(), s2(), var t), lowiphc.IPHC_E_UNSUPPORTED)
+    test.case("EID 7, an IPv6 header: 1110 111 0 = 0xee")
+    test.assert_eq(expand_status("7e33ee", s1(), s2(), var t), lowiphc.IPHC_E_UNSUPPORTED)
+    test.case("EID 5 and 6 are reserved: 0xea and 0xec")
+    test.assert_eq(expand_status("7e33ea", s1(), s2(), var t), lowiphc.IPHC_E_RESERVED)
+    test.assert_eq(expand_status("7e33ec", s1(), s2(), var t), lowiphc.IPHC_E_RESERVED)
+    test.case("an unassigned NHC: 0x00 and 0xf8")
+    test.assert_eq(expand_status("7e3300", s1(), s2(), var t), lowiphc.IPHC_E_RESERVED)
+    test.assert_eq(expand_status("7e33f8", s1(), s2(), var t), lowiphc.IPHC_E_RESERVED)
+    test.case("a Routing header whose length leaves 7 bytes is not a multiple of eight: e2 06 05")
+    test.assert_eq(expand_status("7e33e20605" + "0102030405", s1(), s2(), var t), lowiphc.IPHC_E_BAD)
+    test.case("an extension header whose length runs past the frame")
+    test.assert_eq(expand_status("7e33e2060601", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+    test.case("N=1 with nothing after")
+    test.assert_eq(expand_status("7e33e106010400000000", s1(), s2(), var t), lowiphc.IPHC_E_SHORT)
+
+// ── the datagram's size ─────────────────────────────────────────────
+
+@test
+fn test_the_lengths_come_from_the_size_of_the_datagram() [io]
+    var t = empty_table()
+    test.case("one frame: the payload length is what follows the headers")
+    var f = load_fr("7e33f416331634" + "4142434445")
+    var d: Vec[u8; 1280] = Vec.new()
+    let u = lowiphc.decompress(var f, 0, -1, s1(), s2(), var t, var d)
+    test.assert_eq(u.status, lowiphc.IPHC_OK)
+    test.assert_eq(u.size, 53)
+    test.assert_eq(d[5] as Int, 13)
+    test.assert_eq(d[45] as Int, 13)
+    test.assert_eq(u.pending, false)
+    test.case("a size smaller than what the frame already holds is refused")
+    let u2 = lowiphc.decompress(var f, 0, 50, s1(), s2(), var t, var d)
+    test.assert_eq(u2.status, lowiphc.IPHC_E_BAD)
+    test.case("a size past the buffer is refused")
+    let u3 = lowiphc.decompress(var f, 0, 1281, s1(), s2(), var t, var d)
+    test.assert_eq(u3.status, lowiphc.IPHC_E_BAD)
+    test.case("a datagram that is not UDP has no pending checksum")
+    var g = load_fr("7a333a" + "aabbcc")
+    let u4 = lowiphc.decompress(var g, 0, 100, s1(), s2(), var t, var d)
+    test.assert_eq(u4.status, lowiphc.IPHC_OK)
+    test.assert_eq(u4.pending, false)
+    test.assert_eq(u4.udp_off, -1)
+    test.assert_eq(d[5] as Int, 60)
+
+// ── what the compressor refuses ─────────────────────────────────────
+
+@test
+fn test_a_datagram_that_is_not_an_ipv6_packet_is_refused() [io]
+    var t = empty_table()
+    var out: Vec[u8; 128] = Vec.new()
+    test.case("under 40 bytes")
+    var a = load_dg("6000000000")
+    test.assert_eq(lowiphc.compress(var a, a.len(), s1(), s2(), var t, false, var out).status, lowiphc.IPHC_E_BAD)
+    test.case("a size past what the buffer holds")
+    var b = load_dg(ip6hdr(0, 0, 0, 58, 64, a1(), a2()))
+    test.assert_eq(lowiphc.compress(var b, 50, s1(), s2(), var t, false, var out).status, lowiphc.IPHC_E_BAD)
+    test.case("version 5")
+    var c = load_dg("5000000000003a40" + a1() + a2())
+    test.assert_eq(lowiphc.compress(var c, 40, s1(), s2(), var t, false, var out).status, lowiphc.IPHC_E_BAD)
+    test.case("a payload length that is not the rest of the datagram")
+    var d = load_dg(ip6hdr(0, 0, 9, 58, 64, a1(), a2()) + "aabbcc")
+    test.assert_eq(lowiphc.compress(var d, d.len(), s1(), s2(), var t, false, var out).status, lowiphc.IPHC_E_BAD)
+    test.case("an empty datagram, no payload")
+    var e = load_dg(ip6hdr(0, 0, 0, 59, 64, a1(), a2()))
+    let r = lowiphc.compress(var e, 40, s1(), s2(), var t, false, var out)
+    test.assert_eq(r.status, lowiphc.IPHC_OK)
+    test.assert_eq_str(fr_hex(var out), "7a333b")
+
+// ── packing into one frame ──────────────────────────────────────────
+
+@test
+fn test_a_datagram_that_fits_is_packed_into_one_frame() [io]
+    var t = empty_table()
+    var out: Vec[u8; 128] = Vec.new()
+    var d = load_dg(ip6hdr(0, 0, 3, 58, 64, a1(), a2()) + "aabbcc")
+    test.case("3 bytes of header and 3 of payload")
+    test.assert_eq(lowiphc.pack_frame(var d, d.len(), s1(), s2(), var t, false, 127, var out), 6)
+    test.assert_eq_str(fr_hex(var out), "7a333aaabbcc")
+    test.case("a budget of 5 is one byte short")
+    test.assert_eq(lowiphc.pack_frame(var d, d.len(), s1(), s2(), var t, false, 5, var out), -1)
+    test.assert_eq(lowiphc.pack_frame(var d, d.len(), s1(), s2(), var t, false, 6, var out), 6)
+    test.case("a datagram too big for the frame's own capacity")
+    var big = load_dg(ip6hdr(0, 0, 200, 58, 64, a1(), a2()) + zeros(200))
+    test.assert_eq(lowiphc.pack_frame(var big, big.len(), s1(), s2(), var t, false, 4000, var out), -1)
+    test.case("a fault comes back as its code, negated, below -1")
+    var bad = load_dg("6000000000")
+    test.assert_eq(lowiphc.pack_frame(var bad, bad.len(), s1(), s2(), var t, false, 127, var out),
+        -1 - lowiphc.IPHC_E_BAD)

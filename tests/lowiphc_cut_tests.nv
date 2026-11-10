@@ -1,0 +1,109 @@
+// lowiphc_cut_tests.nv — LOWPAN_IPHC with a field cut short, and a header that
+// does not fit.
+//
+// A compressed header that stops in the middle of a field has to be refused as
+// a short frame, whichever field it stops in.  Each header here is a complete,
+// valid one, derived by hand as in lowiphc_tests.nv; every strict prefix of it
+// is expanded and has to come back as `IPHC_E_SHORT`, and the whole of it has
+// to come back as `IPHC_OK`.
+
+use std.test
+use std.bytes
+use lowpan
+use lowctx
+use lowiphc
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn h2(n: Int) -> Str
+    bytes.to_hex(bytes.u8(n))
+
+fn h4(n: Int) -> Str
+    bytes.to_hex(bytes.u16_be(n))
+
+fn load_dg(s: Str) -> Vec[u8; 1280]
+    var d: Vec[u8; 1280] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = d.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    d
+
+fn load_fr(s: Str) -> Vec[u8; 128]
+    var f: Vec[u8; 128] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = f.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    f
+
+fn a1() -> Str
+    "fe80000000000000000000fffe000001"
+
+fn a2() -> Str
+    "fe80000000000000000000fffe000002"
+
+fn ip6hdr(tc: Int, flow: Int, plen: Int, nh: Int, hop: Int, src: Str, dst: Str) -> Str
+    h2(0x60 | (tc >> 4)) + h2(((tc & 15) << 4) | (flow >> 16)) + h4(flow & 0xFFFF) + h4(plen) + h2(nh) + h2(hop) + src + dst
+
+fn contexts() -> ContextTable
+    var t = lowctx.ctx_table()
+    let _a = lowctx.ctx_set(var t, 4, lowpan.ip6(0x20010DB8, 0, 0, 0), 64, true)
+    let _b = lowctx.ctx_set(var t, 5, lowpan.ip6(0x20010DB8, 0x00000005, 0, 0), 64, true)
+    let _c = lowctx.ctx_set(var t, 3, lowpan.ip6(0x20010DB8, 0x00000003, 0, 0), 64, true)
+    t
+
+fn expand_status(frx: Str, var t: ContextTable) -> Int
+    var f = load_fr(frx)
+    var back: Vec[u8; 1280] = Vec.new()
+    lowiphc.decompress(var f, 0, -1, lowpan.ll_short(1), lowpan.ll_short(2), var t, var back).status
+
+// Whether every strict prefix of the compressed header is a short frame and
+// the whole of it is read.
+fn only_short_when_cut(full: Str, var t: ContextTable) -> Bool
+    let raw = h(full)
+    var all = expand_status(full, var t) == lowiphc.IPHC_OK
+    for cut in 0..bytes.len(raw)
+        if expand_status(bytes.to_hex(bytes.slice(raw, 0, cut)), var t) != lowiphc.IPHC_E_SHORT
+            all = false
+    all
+
+@test
+fn test_every_inline_field_reports_a_short_frame_when_it_is_cut() [io]
+    var t = contexts()
+    test.case("SAM=00 and DAM=00, sixteen bytes each: b1 = 0x00")
+    test.assert_eq(only_short_when_cut("7a003a" + "20010db8000000000000000000000001" + "20010db8000000000000000000000002", var t),
+        true)
+    test.case("SAM=10 and DAM=10, two bytes each: b1 = 0x22")
+    test.assert_eq(only_short_when_cut("7a223a" + "aabb" + "ccdd", var t), true)
+    test.case("M=1 DAM=00: b1 = 0x38")
+    test.assert_eq(only_short_when_cut("7a383a" + "ff0e0000000000000000123456789abc", var t), true)
+    test.case("M=1 DAM=01, six bytes: b1 = 0x39")
+    test.assert_eq(only_short_when_cut("7a393a" + "0201ff000001", var t), true)
+    test.case("M=1 DAM=10, four bytes: b1 = 0x3a")
+    test.assert_eq(only_short_when_cut("7a3a3a" + "05010003", var t), true)
+    test.case("M=1 DAM=11, one byte: b1 = 0x3b")
+    test.assert_eq(only_short_when_cut("7a3b3a" + "01", var t), true)
+    test.case("M=1 DAC=1 DAM=00 with context 4, six bytes: b1 = 0xbc, CID byte 0x04")
+    test.assert_eq(only_short_when_cut("7abc043a" + "3e0000000001", var t), true)
+    test.case("TF=10, one byte: b0 = 0x72")
+    test.assert_eq(only_short_when_cut("72332e3a", var t), true)
+    test.case("TF=01, three bytes: b0 = 0x6a")
+    test.assert_eq(only_short_when_cut("6a33c123453a", var t), true)
+    test.case("TF=00, four bytes: b0 = 0x62")
+    test.assert_eq(only_short_when_cut("62336e0abcde3a", var t), true)
+    test.case("the hop limit in-line: b0 = 0x78")
+    test.assert_eq(only_short_when_cut("78333a11", var t), true)
+
+@test
+fn test_a_udp_header_that_does_not_fit_after_a_long_extension_header_is_refused() [io]
+    var t = lowctx.ctx_table()
+    // A Hop-by-Hop header of 120 bytes (hdrextlen 14) compresses to e1, a length of 118 and 118 bytes: 120
+    // after the two bytes of the IPHC, so 122 bytes.  The UDP header's seven bytes then take it past 128.
+    var body = "11" + "0e"
+    for _i in 0..59
+        body = body + "0101"
+    let dgx = ip6hdr(0, 0, 128, 0, 64, a1(), a2()) + body + "1633" + "1634" + "0008" + "abcd"
+    var d = load_dg(dgx)
+    var out: Vec[u8; 128] = Vec.new()
+    let r = lowiphc.compress(var d, d.len(), lowpan.ll_short(1), lowpan.ll_short(2), var t, false, var out)
+    test.assert_eq(r.status, lowiphc.IPHC_E_NOSPACE)

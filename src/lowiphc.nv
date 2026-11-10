@@ -1,0 +1,1079 @@
+// lowiphc.nv — IPv6 header compression for 6LoWPAN, RFC 6282.
+//
+// An IPv6 header is 40 bytes, and an IEEE 802.15.4 frame holds at most 127.
+// LOWPAN_IPHC takes the header down to two bytes where the network allows
+// it, by taking out what both ends can work out for themselves: the version,
+// a traffic class and flow label of zero, a hop limit of 1, 64 or 255, the
+// payload length, the next header, a link-local prefix, a prefix both ends
+// have agreed on (a context), and an interface identifier that is the link
+// layer address.  What cannot be taken out stays in-line, in the order of the
+// IPv6 header.
+//
+// THE FORMAT, from section 3.1 of RFC 6282.  Two bytes, or three with a
+// context byte:
+//
+//    0   1   2   3   4   5   6   7   8   9   0   1   2   3   4   5
+//  +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+//  | 0 | 1 | 1 |  TF   |NH | HLIM  |CID|SAC|  SAM  | M |DAC|  DAM  |
+//  +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+//
+// TF   00 four bytes of traffic class and flow label, 01 three bytes with
+//      the DSCP elided, 10 one byte with the flow label elided, 11 both
+//      elided.
+// NH   1: the next header is encoded by an NHC byte that follows the
+//      addresses; 0: a byte of next header is in-line.
+// HLIM 00 in-line, 01 is 1, 10 is 64, 11 is 255.
+// CID  1: a byte follows with the source context in its high nibble and
+//      the destination context in its low nibble.
+// SAC, SAM, DAC, DAM, M  the address modes of section 3.1.1.
+//
+// After the two or three bytes come the in-line fields in IPv6 order:
+// traffic class and flow label, next header, hop limit, source address,
+// destination address.  Then the next header encodings (NHC) of section 4:
+// one byte for each extension header, `1110 EID N`, and for UDP
+// `11110 C PP`.
+//
+// WHAT IS SUPPORTED.  Compression and expansion of the IPv6 header with
+// every TF, HLIM, SAC/SAM, M/DAC/DAM combination of the RFC; the context
+// byte and a table of 16 contexts; the NHC for UDP with all four port forms
+// and with the checksum elided or in-line; the NHC for the Hop-by-Hop
+// Options, Routing, Destination Options and Mobility headers.  The
+// IPv6-in-IPv6 NHC (EID 7) and the Fragment header NHC (EID 2) are not
+// implemented: the compressor leaves a datagram that has either one
+// uncompressed from that header on, and the expander refuses a packet that
+// uses one with `IPHC_E_UNSUPPORTED`.  The trailing Pad1 or PadN option of a
+// header may be elided by a compressor (section 4.2); this one does not
+// elide it and the expander restores it.
+//
+// BUFFERS.  The compressor writes the compressed headers only, into a
+// `Frame`, and says how many bytes of the datagram they stand for.  The
+// payload that follows is the caller's to append, or the fragmenter's.  The
+// expander writes the whole datagram into a `Datagram`.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+
+use lowpan
+use lowctx
+use lowcsum
+
+// Nothing went wrong.
+pub const IPHC_OK = 0
+// The input ends before a field it announces.
+pub const IPHC_E_SHORT = 1
+// The output buffer is full.
+pub const IPHC_E_NOSPACE = 2
+// The packet refers to a context that is not in use.
+pub const IPHC_E_CONTEXT = 3
+// A reserved encoding: a destination mode that RFC 6282 reserves, or an
+// unassigned NHC.
+pub const IPHC_E_RESERVED = 4
+// An encoding this package does not implement (EID 2 and EID 7).
+pub const IPHC_E_UNSUPPORTED = 5
+// The datagram or the packet is malformed: a version other than 6, a payload
+// length that does not match, an extension header that does not fit.
+pub const IPHC_E_BAD = 6
+// The compressor was told to elide the UDP checksum and it is not correct.
+pub const IPHC_E_CHECKSUM = 7
+// An address mode needs a link address the caller did not give.
+pub const IPHC_E_LINK = 8
+
+// The next header number of a Hop-by-Hop Options header.
+pub const IP6_NH_HOPOPT = 0
+// The next header number of UDP.
+pub const IP6_NH_UDP = 17
+// The next header number of a Routing header.
+pub const IP6_NH_ROUTING = 43
+// The next header number of a Fragment header, which has no encoding here.
+pub const IP6_NH_FRAGMENT = 44
+// The next header number of a Destination Options header.
+pub const IP6_NH_DSTOPTS = 60
+// The next header number of a Mobility header.
+pub const IP6_NH_MOBILITY = 135
+
+// What the compressor did.
+//
+// `status` is `IPHC_OK` or the fault; no other field means anything after a
+// fault.  `header_len` is the number of bytes written to the output.
+// `covered` is the number of bytes of the datagram those bytes stand for:
+// the IPv6 header, the extension headers that were compressed and the UDP
+// header when it was.  The payload starts at index `covered`.  `udp_off` is
+// the index of the UDP header that was compressed, or -1.
+pub @value
+struct IphcPacked
+    status: Int
+    header_len: Int
+    covered: Int
+    udp_off: Int
+
+// What the expander did.
+//
+// `status` is `IPHC_OK` or the fault.  `written` is the number of bytes now
+// in the datagram buffer.  `size` is the size of the whole datagram, which is
+// `written` for a packet in one frame and the size the fragment header gave
+// for the first of several.  `udp_off` is the index of the UDP header, or
+// -1.  `pending` is true when the UDP checksum was elided and the rest of
+// the datagram has not arrived: `restore_checksum` is called when it has.
+pub @value
+struct IphcUnpacked
+    status: Int
+    written: Int
+    size: Int
+    udp_off: Int
+    pending: Bool
+
+// ── Writing ──────────────────────────────────────────────────────────
+
+// Append a byte to a frame.  False when the frame is full.
+@tier(embedded)
+@no_alloc
+fn put(var out: Frame, b: Int) -> Bool
+    match out.push((b & 0xFF) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append a byte to a datagram.
+//
+// The buffer holds 1280 bytes and the most an expansion writes is the IPv6
+// header, eight extension headers of at most 264 bytes each less what the
+// frame gave, and the payload: a 128-byte frame cannot make that exceed the
+// buffer, so the push is never refused and the result is not looked at.
+@tier(embedded)
+@no_alloc
+fn putd(var d: Datagram, b: Int)
+    let _p = d.push((b & 0xFF) as u8)
+
+// Append the `n` bytes of a word, most significant first.
+@tier(embedded)
+@no_alloc
+fn put_be(var out: Frame, v: Int, n: Int) -> Bool
+    var ok = true
+    for i in 0..n
+        ok = put(var out, v >> (8 * (n - 1 - i))) and ok
+    ok
+
+// Append byte `i` of an address.
+@tier(embedded)
+@no_alloc
+fn put_ip6_byte(var out: Frame, a: Ip6, i: Int) -> Bool
+    put(var out, lowpan.ip6_byte(a, i))
+
+// Append bytes `from` up to `to` of an address.
+@tier(embedded)
+@no_alloc
+fn put_ip6_range(var out: Frame, a: Ip6, from: Int, to: Int) -> Bool
+    var ok = true
+    for i in from..to
+        ok = put_ip6_byte(var out, a, i) and ok
+    ok
+
+// The address at `at` in a datagram.
+@tier(embedded)
+@no_alloc
+fn ip6_at(var d: Datagram, at: Int) -> Ip6
+    lowpan.ip6(be32(var d, at), be32(var d, at + 4), be32(var d, at + 8), be32(var d, at + 12))
+
+// The big-endian 32-bit word at `at` in a datagram.
+@tier(embedded)
+@no_alloc
+fn be32(var d: Datagram, at: Int) -> Int
+    (d[at] as Int << 24) | (d[at + 1] as Int << 16) | (d[at + 2] as Int << 8) | d[at + 3] as Int
+
+// The big-endian 16-bit word at `at` in a datagram.
+@tier(embedded)
+@no_alloc
+fn be16(var d: Datagram, at: Int) -> Int
+    (d[at] as Int << 8) | d[at + 1] as Int
+
+// ── Choosing an address mode ─────────────────────────────────────────
+
+// The address the mode `mode` would rebuild from the prefix of context `c`
+// (or from `fe80::/64` when `c` is not valid), the in-line interface
+// identifier `iid2` `iid3` and the link address.
+//
+// Mode 1 takes the identifier in-line, mode 2 builds it from the low 16
+// bits in-line, mode 3 builds it from the link address.
+@tier(embedded)
+@no_alloc
+fn rebuild(c: LowpanContext, stateful: Bool, mode: Int, in2: Int, in3: Int, link: LinkAddr) -> Ip6
+    var iid2 = 0
+    var iid3 = 0
+    if mode == 1
+        iid2 = in2
+        iid3 = in3
+    else if mode == 2
+        iid2 = 0x000000FF
+        iid3 = 0xFE000000 | (in3 & 0xFFFF)
+    else
+        iid2 = lowpan.iid_word2(link)
+        iid3 = lowpan.iid_word3(link)
+    if stateful
+        lowctx.with_prefix(c, iid2, iid3)
+    else
+        lowpan.ip6(0xFE800000, 0, iid2, iid3)
+
+// The unicast address mode that stands for `a` most briefly, 3 down to 1.
+// The caller has seen that the prefix is the link-local one, or a context's,
+// and with the prefix right the identifier can always be carried in-line, so
+// mode 1 is the answer when the other two do not fit.
+@tier(embedded)
+@no_alloc
+fn unicast_mode(c: LowpanContext, stateful: Bool, a: Ip6, link: LinkAddr) -> Int
+    if link.kind != lowpan.SIXLO_LL_NONE
+        if lowpan.ip6_eq(rebuild(c, stateful, 3, 0, 0, link), a)
+            return 3
+    if lowpan.ip6_eq(rebuild(c, stateful, 2, 0, a.w3, link), a)
+        return 2
+    1
+
+// The traffic class of an IPv6 header at `off` of a datagram.
+@tier(embedded)
+@no_alloc
+fn traffic_class(var d: Datagram) -> Int
+    ((d[0] as Int & 0x0F) << 4) | (d[1] as Int >> 4)
+
+// The flow label of the IPv6 header.
+@tier(embedded)
+@no_alloc
+fn flow_label(var d: Datagram) -> Int
+    ((d[1] as Int & 0x0F) << 16) | (d[2] as Int << 8) | d[3] as Int
+
+// The TF mode for a traffic class and flow label.
+@tier(embedded)
+@no_alloc
+fn tf_mode(tc: Int, flow: Int) -> Int
+    if flow == 0 and tc == 0
+        3
+    else if flow == 0
+        2
+    else if (tc >> 2) == 0
+        1
+    else
+        0
+
+// Append the in-line traffic class and flow label for a TF mode.  Figures 4
+// to 6 of RFC 6282: the traffic class is rotated so that the ECN bits come
+// first.
+@tier(embedded)
+@no_alloc
+fn put_tf(var out: Frame, mode: Int, tc: Int, flow: Int) -> Bool
+    let ecn = tc & 3
+    let dscp = tc >> 2
+    if mode == 0
+        put(var out, (ecn << 6) | dscp) and put(var out, (flow >> 16) & 0x0F) and put(var out, flow >> 8) and put(var out, flow)
+    else if mode == 1
+        put(var out, (ecn << 6) | ((flow >> 16) & 0x0F)) and put(var out, flow >> 8) and put(var out, flow)
+    else if mode == 2
+        put(var out, (ecn << 6) | dscp)
+    else
+        true
+
+// ── The next header encodings ────────────────────────────────────────
+
+// The EID of an extension header number, or -1 when the compression has
+// none for it.  Fragment (44) has none in this package.
+@tier(embedded)
+@no_alloc
+fn eid_of(nh: Int) -> Int
+    if nh == IP6_NH_HOPOPT
+        0
+    else if nh == IP6_NH_ROUTING
+        1
+    else if nh == IP6_NH_DSTOPTS
+        3
+    else if nh == IP6_NH_MOBILITY
+        4
+    else
+        -1
+
+// The IPv6 next header number of an EID, or -1 for one that is not
+// implemented or is reserved.
+@tier(embedded)
+@no_alloc
+fn nh_of_eid(eid: Int) -> Int
+    if eid == 0
+        IP6_NH_HOPOPT
+    else if eid == 1
+        IP6_NH_ROUTING
+    else if eid == 3
+        IP6_NH_DSTOPTS
+    else if eid == 4
+        IP6_NH_MOBILITY
+    else
+        -1
+
+// Whether the header with next header number `nh` at `off` of a datagram of
+// `size` bytes can be compressed with an NHC.
+//
+// A UDP header needs its eight bytes.  An extension header needs to lie
+// inside the datagram and to be no more than 255 bytes after its length
+// field once compressed, which is `hdrextlen` of 31 at most.
+@tier(embedded)
+@no_alloc
+fn nhc_ok(var d: Datagram, size: Int, off: Int, nh: Int) -> Bool
+    if nh == IP6_NH_UDP
+        off + 8 <= size
+    else if eid_of(nh) >= 0
+        off + 2 <= size and (d[off + 1] as Int) <= 31 and off + (d[off + 1] as Int + 1) * 8 <= size
+    else
+        false
+
+// The UDP port form that stands for these ports, the P bits of RFC 6282
+// section 4.3.3.
+@tier(embedded)
+@no_alloc
+fn port_mode(src: Int, dst: Int) -> Int
+    if (src & 0xFFF0) == 0xF0B0 and (dst & 0xFFF0) == 0xF0B0
+        3
+    else if (dst & 0xFF00) == 0xF000
+        1
+    else if (src & 0xFF00) == 0xF000
+        2
+    else
+        0
+
+// Append the ports in the form `p`.
+@tier(embedded)
+@no_alloc
+fn put_ports(var out: Frame, p: Int, src: Int, dst: Int) -> Bool
+    if p == 3
+        put(var out, ((src & 0x0F) << 4) | (dst & 0x0F))
+    else if p == 1
+        put(var out, src >> 8) and put(var out, src) and put(var out, dst)
+    else if p == 2
+        put(var out, src) and put(var out, dst >> 8) and put(var out, dst)
+    else
+        put_be(var out, src, 2) and put_be(var out, dst, 2)
+
+// ── Compressing ──────────────────────────────────────────────────────
+
+// A fault, as the compressor reports it.
+@tier(embedded)
+@no_alloc
+fn packed_fault(status: Int) -> IphcPacked
+    IphcPacked { status: status, header_len: 0, covered: 0, udp_off: -1 }
+
+// The source address bits of the IPHC pair: the SAC and SAM fields, and the
+// context number used.  Packed as `sac << 8 | sam << 4 | ctx`, -1 when the
+// address needs a link address that is not there.
+@tier(embedded)
+@no_alloc
+fn source_mode(var t: ContextTable, a: Ip6, link: LinkAddr) -> Int
+    let none = lowctx.ctx_get(var t, 0)
+    if lowpan.is_unspecified(a)
+        return 1 << 8
+    if lowpan.is_link_local(a)
+        return unicast_mode(none, false, a, link) << 4
+    let id = lowctx.ctx_find(var t, a)
+    if id >= 0
+        let c = lowctx.ctx_get(var t, id)
+        return (1 << 8) | (unicast_mode(c, true, a, link) << 4) | id
+    0
+
+// Append the in-line bytes of a source address, given its packed mode.
+@tier(embedded)
+@no_alloc
+fn put_unicast(var out: Frame, a: Ip6, mode: Int) -> Bool
+    if mode == 0
+        put_ip6_range(var out, a, 0, 16)
+    else if mode == 1
+        put_ip6_range(var out, a, 8, 16)
+    else if mode == 2
+        put_ip6_range(var out, a, 14, 16)
+    else
+        true
+
+// Whether a destination address is one of the multicast forms of section
+// 3.2.3 and what mode stands for it: 3 for `ff02::00XX`, 2 for
+// `ffXX::00XX:XXXX`, 1 for `ffXX::00XX:XXXX:XXXX`, 0 for none.
+@tier(embedded)
+@no_alloc
+fn multicast_mode(a: Ip6) -> Int
+    let low_zero = (a.w0 & 0xFFFF) == 0 and a.w1 == 0
+    if a.w0 == 0xFF020000 and a.w1 == 0 and a.w2 == 0 and a.w3 <= 0xFF
+        3
+    else if low_zero and a.w2 == 0 and (a.w3 >> 24) == 0
+        2
+    else if low_zero and a.w2 <= 0xFF
+        1
+    else
+        0
+
+// The context that makes a stateful multicast address: its prefix length is
+// the address's byte 3 and its prefix the address's bytes 4 to 11.  -1 for
+// none.
+@tier(embedded)
+@no_alloc
+fn multicast_context(var t: ContextTable, a: Ip6) -> Int
+    for id in 0..lowctx.SIXLO_CONTEXTS
+        let c = t[id]
+        if c.valid and c.compress and c.len == (a.w0 & 0xFF) and c.w0 == a.w1 and c.w1 == a.w2
+            return id
+    -1
+
+// Append the in-line bytes of a multicast destination in a stateless mode.
+@tier(embedded)
+@no_alloc
+fn put_multicast(var out: Frame, a: Ip6, mode: Int) -> Bool
+    if mode == 3
+        put_ip6_byte(var out, a, 15)
+    else if mode == 2
+        put_ip6_byte(var out, a, 1) and put_ip6_range(var out, a, 13, 16)
+    else if mode == 1
+        put_ip6_byte(var out, a, 1) and put_ip6_range(var out, a, 11, 16)
+    else
+        put_ip6_range(var out, a, 0, 16)
+
+// The destination fields of the IPHC pair, packed as
+// `m << 9 | dac << 8 | dam << 4 | ctx`.  -1 when no mode is available.
+@tier(embedded)
+@no_alloc
+fn dest_mode(var t: ContextTable, a: Ip6, link: LinkAddr) -> Int
+    if lowpan.is_multicast(a)
+        let sm = multicast_mode(a)
+        if sm != 0
+            return (1 << 9) | (sm << 4)
+        let id = multicast_context(var t, a)
+        if id >= 0
+            return (1 << 9) | (1 << 8) | id
+        return 1 << 9
+    let none = lowctx.ctx_get(var t, 0)
+    if lowpan.is_link_local(a)
+        return unicast_mode(none, false, a, link) << 4
+    let id = lowctx.ctx_find(var t, a)
+    if id >= 0
+        let c = lowctx.ctx_get(var t, id)
+        return (1 << 8) | (unicast_mode(c, true, a, link) << 4) | id
+    0
+
+// Append the in-line bytes of a destination address given its packed mode.
+@tier(embedded)
+@no_alloc
+fn put_dest(var out: Frame, a: Ip6, packed: Int) -> Bool
+    let dam = (packed >> 4) & 3
+    if (packed >> 9) == 1
+        if ((packed >> 8) & 1) == 1
+            put_ip6_byte(var out, a, 1) and put_ip6_byte(var out, a, 2) and put_ip6_range(var out, a, 12, 16)
+        else
+            put_multicast(var out, a, dam)
+    else
+        put_unicast(var out, a, dam)
+
+// Where the compressed headers end: the offset in the datagram, the offset of
+// the UDP header that was compressed or -1, and a fault or `IPHC_OK`.
+@value
+struct ChainEnd
+    status: Int
+    covered: Int
+    udp_off: Int
+
+// Append the NHC chain for the headers that follow the IPv6 header, and
+// answer where the compressed headers end.
+@tier(embedded)
+@no_alloc
+fn put_chain(var d: Datagram, size: Int, var out: Frame, elide: Bool) -> ChainEnd
+    var off = 40
+    var nh = d[6] as Int
+    for _step in 0..9
+        if nhc_ok(var d, size, off, nh)
+            if nh == IP6_NH_UDP
+                let src = be16(var d, off)
+                let dst = be16(var d, off + 2)
+                var c = 0
+                if elide
+                    c = 1
+                    if not lowcsum.udp_checksum_ok(var d, 0, off, size - off)
+                        return ChainEnd { status: IPHC_E_CHECKSUM, covered: 0, udp_off: -1 }
+                let p = port_mode(src, dst)
+                var ok = put(var out, 0xF0 | (c << 2) | p) and put_ports(var out, p, src, dst)
+                if c == 0
+                    ok = put_be(var out, be16(var d, off + 6), 2) and ok
+                if not ok
+                    return ChainEnd { status: IPHC_E_NOSPACE, covered: 0, udp_off: -1 }
+                return ChainEnd { status: IPHC_OK, covered: off + 8, udp_off: off }
+            else
+                let total = (d[off + 1] as Int + 1) * 8
+                let nh2 = d[off] as Int
+                let more = nhc_ok(var d, size, off + total, nh2)
+                var n = 0
+                if more
+                    n = 1
+                var ok = put(var out, 0xE0 | (eid_of(nh) << 1) | n)
+                if not more
+                    ok = put(var out, nh2) and ok
+                ok = put(var out, total - 2) and ok
+                for i in 2..total
+                    ok = put(var out, d[off + i] as Int) and ok
+                if not ok
+                    return ChainEnd { status: IPHC_E_NOSPACE, covered: 0, udp_off: -1 }
+                off = off + total
+                nh = nh2
+    ChainEnd { status: IPHC_OK, covered: off, udp_off: -1 }
+
+// Compress the IPv6 header, and the headers after it that can be, of the
+// datagram in `d` of `size` bytes.
+//
+// `src_ll` and `dst_ll` are the link addresses of the frame the packet will
+// travel in; an address that equals the one its link address makes is
+// elided.  `t` holds the contexts.  `elide` authorises eliding the UDP
+// checksum, which the upper layer alone may do (RFC 6282 section 4.3.2);
+// the checksum is verified first and a wrong one is `IPHC_E_CHECKSUM`.
+//
+// The compressed headers are written to `out`, which is emptied first.
+// Refuses `IPHC_E_BAD` for a datagram under 40 bytes, a version other than
+// 6, or a payload length that is not `size - 40`, and `IPHC_E_NOSPACE` when
+// the headers do not fit the frame.
+//
+// ```novo
+// use lowpan
+// use lowctx
+// use lowiphc
+//
+// fn main() [io]
+//     // A UDP datagram between two link-local addresses derived from short
+//     // addresses 0x0001 and 0x0002: hop limit 64, ports 5683 and 5684.
+//     var d: Vec[u8; 1280] = Vec.new()
+//     for b in [0x60, 0x00, 0x00, 0x00, 0x00, 0x09, 0x11, 0x40]
+//         let _a = d.push(b as u8)
+//     for b in [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x01]
+//         let _b = d.push(b as u8)
+//     for b in [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0x02]
+//         let _c = d.push(b as u8)
+//     for b in [0x16, 0x33, 0x16, 0x34, 0x00, 0x09, 0xab, 0xcd, 0x42]
+//         let _e = d.push(b as u8)
+//     var t = lowctx.ctx_table()
+//     var out: Vec[u8; 128] = Vec.new()
+//     let r = lowiphc.compress(var d, 49, lowpan.ll_short(1), lowpan.ll_short(2), var t, false, var out)
+//     println("${r.status} ${r.header_len} ${r.covered}")   // 0 9 48
+// ```
+pub @tier(embedded)
+@no_alloc
+fn compress(var d: Datagram, size: Int, src_ll: LinkAddr, dst_ll: LinkAddr, var t: ContextTable,
+            elide: Bool, var out: Frame) -> IphcPacked []
+    out.clear()
+    if size < 40 or size > d.len() or (d[0] as Int >> 4) != 6 or be16(var d, 4) != size - 40
+        return packed_fault(IPHC_E_BAD)
+    let tc = traffic_class(var d)
+    let flow = flow_label(var d)
+    let tfm = tf_mode(tc, flow)
+    let nh = d[6] as Int
+    let hop = d[7] as Int
+    let src = ip6_at(var d, 8)
+    let dst = ip6_at(var d, 24)
+    let nhc = nhc_ok(var d, size, 40, nh)
+    var hlim = 0
+    if hop == 1
+        hlim = 1
+    else if hop == 64
+        hlim = 2
+    else if hop == 255
+        hlim = 3
+    let sm = source_mode(var t, src, src_ll)
+    let dm = dest_mode(var t, dst, dst_ll)
+    let sctx = sm & 0xF
+    var dctx = 0
+    if ((dm >> 8) & 1) == 1
+        dctx = dm & 0xF
+    var cid = 0
+    if sctx != 0 or dctx != 0
+        cid = 1
+    var nhbit = 0
+    if nhc
+        nhbit = 1
+    let b0 = 0x60 | (tfm << 3) | (nhbit << 2) | hlim
+    let sac = (sm >> 8) & 1
+    let sam = (sm >> 4) & 3
+    let mbit = (dm >> 9) & 1
+    let dac = (dm >> 8) & 1
+    let dam = (dm >> 4) & 3
+    let b1 = (cid << 7) | (sac << 6) | (sam << 4) | (mbit << 3) | (dac << 2) | dam
+    // The dispatch, the context byte, the traffic class and flow label, the next
+    // header, the hop limit and both addresses take at most 2 + 1 + 4 + 1 + 1 +
+    // 16 + 16 bytes, which the frame holds, so these writes are not refused.
+    let _a = put(var out, b0)
+    let _b = put(var out, b1)
+    if cid == 1
+        let _c = put(var out, (sctx << 4) | dctx)
+    let _d = put_tf(var out, tfm, tc, flow)
+    if not nhc
+        let _e = put(var out, nh)
+    if hlim == 0
+        let _f = put(var out, hop)
+    if sac == 0 or sam != 0
+        let _g = put_unicast(var out, src, sam)
+    let _h = put_dest(var out, dst, dm)
+    var covered = 40
+    var udp = -1
+    if nhc
+        let end = put_chain(var d, size, var out, elide)
+        if end.status != IPHC_OK
+            return packed_fault(end.status)
+        covered = end.covered
+        udp = end.udp_off
+    IphcPacked { status: IPHC_OK, header_len: out.len(), covered: covered, udp_off: udp }
+
+// Compress a datagram into one frame, headers and payload.
+//
+// Answers the length of the frame's payload, or -1 when the compressed
+// headers and the whole payload do not fit `budget` bytes, in which case the
+// caller fragments (`lowfrag`), and a negative fault otherwise: the
+// `IPHC_E_*` code, negated, below -1.  `out` is emptied first.
+pub @tier(embedded)
+@no_alloc
+fn pack_frame(var d: Datagram, size: Int, src_ll: LinkAddr, dst_ll: LinkAddr, var t: ContextTable,
+              elide: Bool, budget: Int, var out: Frame) -> Int []
+    let r = compress(var d, size, src_ll, dst_ll, var t, elide, var out)
+    if r.status != IPHC_OK
+        return -1 - r.status
+    if r.header_len + (size - r.covered) > budget or r.header_len + (size - r.covered) > out.capacity()
+        return -1
+    for i in r.covered..size
+        let _p = out.push(d[i])
+    out.len()
+
+// ── Expanding ────────────────────────────────────────────────────────
+
+// An expansion that failed.
+@tier(embedded)
+@no_alloc
+fn unpacked_fault(status: Int) -> IphcUnpacked
+    IphcUnpacked { status: status, written: 0, size: 0, udp_off: -1, pending: false }
+
+// An address read from a frame, or the fault.
+@value
+struct AddrRead
+    status: Int
+    a: Ip6
+    next: Int
+
+// A fault of an address read.
+@tier(embedded)
+@no_alloc
+fn addr_fault(status: Int) -> AddrRead
+    AddrRead { status: status, a: lowpan.ip6_unspecified(), next: 0 }
+
+// The `n` bytes at `pos` in a frame as a big-endian number, or -1 when the
+// frame ends first.
+@tier(embedded)
+@no_alloc
+fn take(var f: Frame, pos: Int, n: Int) -> Int
+    if pos + n > f.len()
+        return -1
+    var v = 0
+    for i in 0..n
+        v = (v << 8) | f[pos + i] as Int
+    v
+
+// Read 16 bytes in-line at `pos`.
+@tier(embedded)
+@no_alloc
+fn read_full(var f: Frame, pos: Int) -> AddrRead
+    let w0 = take(var f, pos, 4)
+    let w3 = take(var f, pos + 12, 4)
+    if w0 < 0 or w3 < 0
+        return addr_fault(IPHC_E_SHORT)
+    AddrRead { status: IPHC_OK,
+        a: lowpan.ip6(w0, take(var f, pos + 4, 4), take(var f, pos + 8, 4), w3),
+        next: pos + 16 }
+
+// Read a unicast address in mode `mode` at `pos`.  `stateful` selects the
+// context `c`, otherwise the link-local prefix.
+@tier(embedded)
+@no_alloc
+fn read_unicast(var f: Frame, pos: Int, mode: Int, c: LowpanContext, stateful: Bool,
+                link: LinkAddr) -> AddrRead
+    if mode == 0
+        return read_full(var f, pos)
+    if mode == 1
+        let in2 = take(var f, pos, 4)
+        let in3 = take(var f, pos + 4, 4)
+        if in2 < 0 or in3 < 0
+            return addr_fault(IPHC_E_SHORT)
+        return AddrRead { status: IPHC_OK, a: rebuild(c, stateful, 1, in2, in3, link), next: pos + 8 }
+    if mode == 2
+        let in3 = take(var f, pos, 2)
+        if in3 < 0
+            return addr_fault(IPHC_E_SHORT)
+        return AddrRead { status: IPHC_OK, a: rebuild(c, stateful, 2, 0, in3, link), next: pos + 2 }
+    if link.kind == lowpan.SIXLO_LL_NONE
+        return addr_fault(IPHC_E_LINK)
+    AddrRead { status: IPHC_OK, a: rebuild(c, stateful, 3, 0, 0, link), next: pos }
+
+// Read the source address.
+@tier(embedded)
+@no_alloc
+fn read_source(var f: Frame, pos: Int, sac: Int, sam: Int, sctx: Int, var t: ContextTable,
+               link: LinkAddr) -> AddrRead
+    if sac == 1
+        let c = lowctx.ctx_get(var t, sctx)
+        if sam == 0
+            return AddrRead { status: IPHC_OK, a: lowpan.ip6_unspecified(), next: pos }
+        if not c.valid
+            return addr_fault(IPHC_E_CONTEXT)
+        return read_unicast(var f, pos, sam, c, true, link)
+    read_unicast(var f, pos, sam, lowctx.ctx_get(var t, 0), false, link)
+
+// Read a multicast destination in a stateless mode.
+@tier(embedded)
+@no_alloc
+fn read_multicast(var f: Frame, pos: Int, dam: Int) -> AddrRead
+    if dam == 0
+        return read_full(var f, pos)
+    if dam == 1
+        let flags = take(var f, pos, 1)
+        let rest = take(var f, pos + 1, 5)
+        if flags < 0 or rest < 0
+            return addr_fault(IPHC_E_SHORT)
+        return AddrRead { status: IPHC_OK, a: lowpan.ip6(0xFF000000 | (flags << 16), 0, rest >> 32, rest & 0xFFFFFFFF),
+                          next: pos + 6 }
+    if dam == 2
+        let flags = take(var f, pos, 1)
+        let rest = take(var f, pos + 1, 3)
+        if flags < 0 or rest < 0
+            return addr_fault(IPHC_E_SHORT)
+        return AddrRead { status: IPHC_OK,
+            a: lowpan.ip6(0xFF000000 | (flags << 16), 0, 0, rest),
+            next: pos + 4 }
+    let g = take(var f, pos, 1)
+    if g < 0
+        return addr_fault(IPHC_E_SHORT)
+    AddrRead { status: IPHC_OK, a: lowpan.ip6(0xFF020000, 0, 0, g), next: pos + 1 }
+
+// Read the destination address.
+@tier(embedded)
+@no_alloc
+fn read_dest(var f: Frame, pos: Int, m: Int, dac: Int, dam: Int, dctx: Int, var t: ContextTable,
+             link: LinkAddr) -> AddrRead
+    let c = lowctx.ctx_get(var t, dctx)
+    if m == 1 and dac == 1
+        if dam != 0
+            return addr_fault(IPHC_E_RESERVED)
+        if not c.valid
+            return addr_fault(IPHC_E_CONTEXT)
+        let flags = take(var f, pos, 1)
+        let riid = take(var f, pos + 1, 1)
+        let group = take(var f, pos + 2, 4)
+        if flags < 0 or riid < 0 or group < 0
+            return addr_fault(IPHC_E_SHORT)
+        return AddrRead { status: IPHC_OK,
+                          a: lowpan.ip6(0xFF000000 | (flags << 16) | (riid << 8) | c.len, c.w0, c.w1, group),
+                          next: pos + 6 }
+    if m == 1
+        return read_multicast(var f, pos, dam)
+    if dac == 1
+        if dam == 0
+            return addr_fault(IPHC_E_RESERVED)
+        if not c.valid
+            return addr_fault(IPHC_E_CONTEXT)
+        return read_unicast(var f, pos, dam, c, true, link)
+    read_unicast(var f, pos, dam, lowctx.ctx_get(var t, 0), false, link)
+
+// The state of an expansion that the stages share: where the next input is
+// and where the next header's number has to be written.
+@value
+struct Cursor
+    status: Int
+    pos: Int
+    nh_at: Int
+    udp_off: Int
+    elided: Bool
+
+// The IPv6 header's first four bytes for a traffic class and flow label.
+@tier(embedded)
+@no_alloc
+fn put_vtf(var d: Datagram, tc: Int, flow: Int)
+    putd(var d, 0x60 | (tc >> 4))
+    putd(var d, ((tc & 0x0F) << 4) | ((flow >> 16) & 0x0F))
+    putd(var d, flow >> 8)
+    putd(var d, flow)
+
+// Read the traffic class and flow label of TF mode `tfm` at `pos` and
+// answer `tc << 24 | flow` and the next position, as two numbers packed
+// `tc << 40 | flow << 8 | used`, -1 on a short frame.
+@tier(embedded)
+@no_alloc
+fn read_tf(var f: Frame, pos: Int, tfm: Int) -> Int
+    if tfm == 3
+        return 0
+    if tfm == 2
+        let b = take(var f, pos, 1)
+        if b < 0
+            return -1
+        let tc = ((b >> 6) & 3) | ((b & 0x3F) << 2)
+        return (tc << 40) | 1
+    if tfm == 1
+        let v = take(var f, pos, 3)
+        if v < 0
+            return -1
+        let ecn = (v >> 22) & 3
+        let flow = v & 0x0FFFFF
+        return (ecn << 40) | (flow << 8) | 3
+    let v = take(var f, pos, 4)
+    if v < 0
+        return -1
+    let ecn = (v >> 30) & 3
+    let dscp = (v >> 24) & 0x3F
+    let flow = v & 0x0FFFFF
+    (((dscp << 2) | ecn) << 40) | (flow << 8) | 4
+
+// Write the NHC UDP header at the end of the datagram and answer the new
+// cursor.  The length is patched later.
+@tier(embedded)
+@no_alloc
+fn expand_udp(var f: Frame, pos0: Int, n: Int, var d: Datagram, nh_at: Int) -> Cursor
+    var pos = pos0 + 1
+    let c = (n >> 2) & 1
+    let p = n & 3
+    var src = 0
+    var dst = 0
+    if p == 0
+        src = take(var f, pos, 2)
+        dst = take(var f, pos + 2, 2)
+        pos = pos + 4
+    else if p == 1
+        src = take(var f, pos, 2)
+        let lo = take(var f, pos + 2, 1)
+        dst = 0xF000 | lo
+        pos = pos + 3
+    else if p == 2
+        let lo = take(var f, pos, 1)
+        src = 0xF000 | lo
+        dst = take(var f, pos + 1, 2)
+        pos = pos + 3
+    else
+        let both = take(var f, pos, 1)
+        src = 0xF0B0 | (both >> 4)
+        dst = 0xF0B0 | (both & 0x0F)
+        pos = pos + 1
+    var sum = 0
+    if c == 0
+        sum = take(var f, pos, 2)
+        pos = pos + 2
+    if src < 0 or dst < 0 or sum < 0
+        return Cursor { status: IPHC_E_SHORT, pos: pos, nh_at: 0, udp_off: -1, elided: false }
+    let at = d.len()
+    d[nh_at] = IP6_NH_UDP as u8
+    putd(var d, src >> 8)
+    putd(var d, src)
+    putd(var d, dst >> 8)
+    putd(var d, dst)
+    putd(var d, 0)
+    putd(var d, 0)
+    putd(var d, sum >> 8)
+    putd(var d, sum)
+    Cursor { status: IPHC_OK, pos: pos, nh_at: 0, udp_off: at, elided: c == 1 }
+
+// Write an extension header from its NHC at `pos0`, answering the cursor.
+// `more` is the N bit.  The header's own next header number is patched once
+// the next encoding is read when `more` is 1, and written now otherwise.
+@tier(embedded)
+@no_alloc
+fn expand_ext(var f: Frame, pos0: Int, n: Int, var d: Datagram, nh_at: Int) -> Cursor
+    let eid = (n >> 1) & 7
+    let nh = nh_of_eid(eid)
+    if nh < 0
+        var why = IPHC_E_UNSUPPORTED
+        if eid == 5 or eid == 6
+            why = IPHC_E_RESERVED
+        return Cursor { status: why, pos: pos0, nh_at: 0, udp_off: -1, elided: false }
+    var pos = pos0 + 1
+    var inline_nh = 0
+    if (n & 1) == 0
+        inline_nh = take(var f, pos, 1)
+        pos = pos + 1
+    let len = take(var f, pos, 1)
+    pos = pos + 1
+    if inline_nh < 0 or len < 0 or pos + len > f.len()
+        return Cursor { status: IPHC_E_SHORT, pos: pos, nh_at: 0, udp_off: -1, elided: false }
+    let total = 2 + len
+    var padded = total
+    if eid == 0 or eid == 3
+        padded = (total + 7) / 8 * 8
+    if (padded & 7) != 0
+        return Cursor { status: IPHC_E_BAD, pos: pos, nh_at: 0, udp_off: -1, elided: false }
+    let at = d.len()
+    d[nh_at] = nh as u8
+    putd(var d, inline_nh)
+    putd(var d, padded / 8 - 1)
+    for i in 0..len
+        putd(var d, f[pos + i] as Int)
+    let pad = padded - total
+    if pad == 1
+        putd(var d, 0)
+    else if pad > 1
+        putd(var d, 1)
+        putd(var d, pad - 2)
+        for _i in 0..pad - 2
+            putd(var d, 0)
+    Cursor { status: IPHC_OK, pos: pos + len, nh_at: at, udp_off: -1, elided: false }
+
+// Expand the NHC chain at `pos`, writing into `d`.
+@tier(embedded)
+@no_alloc
+fn expand_chain(var f: Frame, pos0: Int, var d: Datagram) -> Cursor
+    var cur = Cursor { status: IPHC_OK, pos: pos0, nh_at: 6, udp_off: -1, elided: false }
+    var more = true
+    for _step in 0..9
+        if more and cur.status == IPHC_OK
+            let n = take(var f, cur.pos, 1)
+            if n < 0
+                cur = Cursor { status: IPHC_E_SHORT, pos: cur.pos, nh_at: 0, udp_off: -1, elided: false }
+            else if (n & 0xF0) == 0xE0
+                cur = expand_ext(var f, cur.pos, n, var d, cur.nh_at)
+                more = (n & 1) == 1
+            else if (n & 0xF8) == 0xF0
+                cur = expand_udp(var f, cur.pos, n, var d, cur.nh_at)
+                more = false
+            else
+                cur = Cursor { status: IPHC_E_RESERVED,
+                    pos: cur.pos,
+                    nh_at: 0,
+                    udp_off: -1,
+                    elided: false }
+    cur
+
+// Put back the UDP checksum that was elided, once the whole datagram is in
+// `d`.  `size` is the datagram's size and `udp_off` the index of the UDP
+// header.
+pub @tier(embedded)
+@no_alloc
+fn restore_checksum(var d: Datagram, size: Int, udp_off: Int) -> Bool []
+    if udp_off < 0 or udp_off + 8 > size or size > d.len()
+        return false
+    let c = lowcsum.udp_checksum(var d, 0, udp_off, size - udp_off)
+    d[udp_off + 6] = ((c >> 8) & 0xFF) as u8
+    d[udp_off + 7] = (c & 0xFF) as u8
+    true
+
+// Expand a LOWPAN_IPHC packet.
+//
+// `f` holds the frame's payload and `at` is the index of the IPHC dispatch
+// byte.  `dg_size` is the size of the whole datagram when the packet is the
+// first fragment of several (the fragment header's datagram_size), and -1
+// when the packet is the whole datagram.  `src_ll` and `dst_ll` are the link
+// addresses of the frame, from which an elided identifier is rebuilt.  The
+// datagram is written to `d`, emptied first: the IPv6 header, the expanded
+// extension headers and UDP header, then the bytes of the frame that follow
+// the compressed headers.
+//
+// The IPv6 payload length and the UDP length are filled in from the size of
+// the datagram.  An elided UDP checksum is recomputed when the whole
+// datagram is present, and otherwise reported in `pending` for
+// `restore_checksum`.
+//
+// ```novo
+// use lowpan
+// use lowctx
+// use lowiphc
+//
+// fn main() [io]
+//     // IPHC 7a 33: traffic class and flow label elided, hop limit 64, both
+//     // addresses elided, the next header (58) in-line.
+//     var f: Vec[u8; 128] = Vec.new()
+//     for b in [0x7a, 0x33, 0x3a, 0xde, 0xad]
+//         let _a = f.push(b as u8)
+//     var t = lowctx.ctx_table()
+//     var d: Vec[u8; 1280] = Vec.new()
+//     let r = lowiphc.decompress(var f, 0, -1, lowpan.ll_short(1), lowpan.ll_short(2), var t, var d)
+//     println("${r.status} ${r.size} ${d[6]}")   // 0 42 58
+// ```
+pub @tier(embedded)
+@no_alloc
+fn decompress(var f: Frame, at: Int, dg_size: Int, src_ll: LinkAddr, dst_ll: LinkAddr,
+              var t: ContextTable, var d: Datagram) -> IphcUnpacked []
+    d.clear()
+    let b0 = take(var f, at, 1)
+    let b1 = take(var f, at + 1, 1)
+    if b0 < 0 or b1 < 0
+        return unpacked_fault(IPHC_E_SHORT)
+    if (b0 >> 5) != 3
+        return unpacked_fault(IPHC_E_BAD)
+    let tfm = (b0 >> 3) & 3
+    let nhbit = (b0 >> 2) & 1
+    let hlim = b0 & 3
+    let cid = (b1 >> 7) & 1
+    let sac = (b1 >> 6) & 1
+    let sam = (b1 >> 4) & 3
+    let m = (b1 >> 3) & 1
+    let dac = (b1 >> 2) & 1
+    let dam = b1 & 3
+    var pos = at + 2
+    var sctx = 0
+    var dctx = 0
+    if cid == 1
+        let x = take(var f, pos, 1)
+        if x < 0
+            return unpacked_fault(IPHC_E_SHORT)
+        sctx = x >> 4
+        dctx = x & 0x0F
+        pos = pos + 1
+    let tfv = read_tf(var f, pos, tfm)
+    if tfv < 0
+        return unpacked_fault(IPHC_E_SHORT)
+    let tc = (tfv >> 40) & 0xFF
+    let flow = (tfv >> 8) & 0xFFFFF
+    pos = pos + (tfv & 0xFF)
+    var nh = 0
+    if nhbit == 0
+        nh = take(var f, pos, 1)
+        pos = pos + 1
+    var hop = 0
+    if hlim == 0
+        hop = take(var f, pos, 1)
+        pos = pos + 1
+    else if hlim == 1
+        hop = 1
+    else if hlim == 2
+        hop = 64
+    else
+        hop = 255
+    if nh < 0 or hop < 0
+        return unpacked_fault(IPHC_E_SHORT)
+    let sr = read_source(var f, pos, sac, sam, sctx, var t, src_ll)
+    if sr.status != IPHC_OK
+        return unpacked_fault(sr.status)
+    let dr = read_dest(var f, sr.next, m, dac, dam, dctx, var t, dst_ll)
+    if dr.status != IPHC_OK
+        return unpacked_fault(dr.status)
+    put_vtf(var d, tc, flow)
+    putd(var d, 0)
+    putd(var d, 0)
+    putd(var d, nh)
+    putd(var d, hop)
+    put_addr(var d, sr.a)
+    put_addr(var d, dr.a)
+    var cur = Cursor { status: IPHC_OK, pos: dr.next, nh_at: 6, udp_off: -1, elided: false }
+    if nhbit == 1
+        cur = expand_chain(var f, dr.next, var d)
+        if cur.status != IPHC_OK
+            return unpacked_fault(cur.status)
+    for i in cur.pos..f.len()
+        putd(var d, f[i] as Int)
+    var size = d.len()
+    if dg_size >= 0
+        size = dg_size
+    if size > d.capacity() or size < d.len()
+        return unpacked_fault(IPHC_E_BAD)
+    d[4] = (((size - 40) >> 8) & 0xFF) as u8
+    d[5] = ((size - 40) & 0xFF) as u8
+    var pending = false
+    if cur.udp_off >= 0
+        let ulen = size - cur.udp_off
+        d[cur.udp_off + 4] = ((ulen >> 8) & 0xFF) as u8
+        d[cur.udp_off + 5] = (ulen & 0xFF) as u8
+        if cur.elided
+            if size == d.len()
+                let _r = restore_checksum(var d, size, cur.udp_off)
+            else
+                pending = true
+    IphcUnpacked { status: IPHC_OK,
+        written: d.len(),
+        size: size,
+        udp_off: cur.udp_off,
+        pending: pending }
+
+// Append the 16 bytes of an address to a datagram.
+@tier(embedded)
+@no_alloc
+fn put_addr(var d: Datagram, a: Ip6)
+    for i in 0..16
+        putd(var d, lowpan.ip6_byte(a, i))

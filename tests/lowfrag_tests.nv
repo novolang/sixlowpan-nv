@@ -1,0 +1,416 @@
+// lowfrag_tests.nv — fragment headers, the sender, and the reassembly buffer.
+//
+// The fragment headers are derived by hand from RFC 4944 section 5.3:
+//
+//   FRAG1  11000 sss | size low 8 | tag high | tag low
+//   FRAGN  11100 sss | size low 8 | tag high | tag low | offset in 8-byte units
+//
+// where sss are the top three bits of the 11-bit datagram_size.  A datagram of
+// 300 bytes (0x12c) is sss=001 and 0x2c, so FRAG1 starts c1 2c and FRAGN e1 2c;
+// with the tag 0xbeef each has the next two bytes be ef.
+//
+// The datagram of the fragmenting tests is 300 bytes: an IPv6 header from A1 to
+// A2 with a UDP header from 0x1633 to 0x1634 and 252 bytes of payload, whose
+// byte i is the low byte of i.  Its headers compress to the nine bytes
+// 7e 33 f0 16 33 16 34 ab cd and stand for the first 48 bytes.  With a frame
+// payload budget of 80 bytes:
+//
+//   first fragment:  4 + 9 = 13 bytes of header, 67 bytes of room; 48 + 67 =
+//                    115 rounds down to 112, so 64 payload bytes, 77 in all
+//   second:          80 - 5 = 75 bytes of room; 112 + 75 = 187 rounds down to
+//                    184, 72 payload bytes, offset 112/8 = 14 = 0x0e
+//   third:           offset 184/8 = 23 = 0x17, 72 payload bytes, reaching 256
+//   fourth:          offset 256/8 = 32 = 0x20, the 44 bytes that are left
+
+use std.test
+use std.bytes
+use std.list
+use lowpan
+use lowctx
+use lowiphc
+use lowfrag
+use lowcsum
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn h2(n: Int) -> Str
+    bytes.to_hex(bytes.u8(n))
+
+fn h4(n: Int) -> Str
+    bytes.to_hex(bytes.u16_be(n))
+
+fn load_fr(s: Str) -> Vec[u8; 128]
+    var f: Vec[u8; 128] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = f.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    f
+
+fn fr_hex(var f: Vec[u8; 128]) -> Str
+    var b = bytes.zeros(f.len())
+    for i in 0..f.len()
+        bytes.set_u8(b, i, f[i] as Int)
+    bytes.to_hex(b)
+
+fn dg_hex(var d: Vec[u8; 1280]) -> Str
+    var b = bytes.zeros(d.len())
+    for i in 0..d.len()
+        bytes.set_u8(b, i, d[i] as Int)
+    bytes.to_hex(b)
+
+fn a1() -> Str
+    "fe80000000000000000000fffe000001"
+
+fn a2() -> Str
+    "fe80000000000000000000fffe000002"
+
+fn s1() -> LinkAddr
+    lowpan.ll_short(1)
+
+fn s2() -> LinkAddr
+    lowpan.ll_short(2)
+
+// Bytes `from` up to `to` of the pattern "byte i is the low byte of i", in hex.
+fn pattern(from: Int, to: Int) -> Str
+    var s = ""
+    for i in from..to
+        s = s + h2(i & 0xFF)
+    s
+
+// The 300-byte datagram: headers, then the pattern from index 48.
+fn datagram_hex() -> Str
+    h2(0x60) + "000000" + h4(260) + "11" + "40" + a1() + a2() + "16331634" + h4(260) + "abcd" + pattern(48, 300)
+
+fn load_dg(s: Str) -> Vec[u8; 1280]
+    var d: Vec[u8; 1280] = Vec.new()
+    let raw = h(s)
+    for i in 0..bytes.len(raw)
+        let _p = d.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    d
+
+// The four fragments of the datagram, built by the sender.
+fn fragments() -> [Str]
+    var t = lowctx.ctx_table()
+    var d = load_dg(datagram_hex())
+    var hdr: Vec[u8; 128] = Vec.new()
+    let p = lowiphc.compress(var d, 300, s1(), s2(), var t, false, var hdr)
+    var out: Vec[u8; 128] = Vec.new()
+    var frames: [Str] = []
+    var done = lowfrag.frag_first(var out, var d, 300, var hdr, p.covered, 0xBEEF, 80)
+    list.push(frames, fr_hex(var out))
+    for _i in 0..8
+        if done > 0 and done < 300
+            done = lowfrag.frag_next(var out, var d, 300, 0xBEEF, done, 80)
+            list.push(frames, fr_hex(var out))
+    frames
+
+// ── headers ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_first_fragment_header_is_four_bytes() [io]
+    // c2 ab 01 02: 11000 010, size = 0x2ab = 683, tag 0x0102 = 258.
+    var f = load_fr("c2ab0102aa")
+    let hd = lowfrag.frag_header(var f, 0)
+    test.assert_eq(hd.ok, true)
+    test.assert_eq(hd.first, true)
+    test.assert_eq(hd.size, 683)
+    test.assert_eq(hd.tag, 258)
+    test.assert_eq(hd.offset, 0)
+    test.assert_eq(hd.hdr_len, 4)
+
+@test
+fn test_a_later_fragment_header_is_five_bytes_with_an_offset_in_eights() [io]
+    // e1 2c be ef 05: 11100 001, size 300, tag 0xbeef, offset 5 * 8 = 40.
+    var f = load_fr("e12cbeef05aa")
+    let hd = lowfrag.frag_header(var f, 0)
+    test.assert_eq(hd.ok, true)
+    test.assert_eq(hd.first, false)
+    test.assert_eq(hd.size, 300)
+    test.assert_eq(hd.tag, 0xBEEF)
+    test.assert_eq(hd.offset, 40)
+    test.assert_eq(hd.hdr_len, 5)
+    test.case("read from an offset")
+    var g = load_fr("99e12cbeef05aa")
+    test.assert_eq(lowfrag.frag_header(var g, 1).offset, 40)
+
+@test
+fn test_a_header_that_is_not_one_is_not_ok() [io]
+    test.case("an IPHC byte")
+    var a = load_fr("7a333a3b")
+    test.assert_eq(lowfrag.frag_header(var a, 0).ok, false)
+    test.case("a datagram_size of zero")
+    var b = load_fr("c000beef")
+    test.assert_eq(lowfrag.frag_header(var b, 0).ok, false)
+    test.case("three bytes of a first fragment header")
+    var c = load_fr("c12cbe")
+    test.assert_eq(lowfrag.frag_header(var c, 0).ok, false)
+    test.case("four bytes of a later fragment header")
+    var d = load_fr("e12cbeef")
+    test.assert_eq(lowfrag.frag_header(var d, 0).ok, false)
+    test.case("an offset past the frame")
+    test.assert_eq(lowfrag.frag_header(var d, 9).ok, false)
+    test.assert_eq(lowfrag.frag_header(var d, -1).ok, false)
+
+// ── sending ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_datagram_is_cut_into_fragments_on_eight_byte_boundaries() [io]
+    let fr = fragments()
+    test.case("four fragments")
+    test.assert_eq(fr.len(), 4)
+    test.case("the first: header, compressed headers, 64 payload bytes")
+    test.assert_eq_str(fr[0], "c12cbeef" + "7e33f016331634abcd" + pattern(48, 112))
+    test.case("the second at offset 14")
+    test.assert_eq_str(fr[1], "e12cbeef0e" + pattern(112, 184))
+    test.case("the third at offset 23")
+    test.assert_eq_str(fr[2], "e12cbeef17" + pattern(184, 256))
+    test.case("the last, 44 bytes at offset 32")
+    test.assert_eq_str(fr[3], "e12cbeef20" + pattern(256, 300))
+
+@test
+fn test_the_sender_refuses_what_cannot_be_cut() [io]
+    var d = load_dg(datagram_hex())
+    var hdr = load_fr("7e33f016331634abcd")
+    var out: Vec[u8; 128] = Vec.new()
+    test.case("a datagram_size past 2047")
+    test.assert_eq(lowfrag.frag_first(var out, var d, 2048, var hdr, 48, 1, 80), -1)
+    test.case("a size of zero, and one past the buffer")
+    test.assert_eq(lowfrag.frag_first(var out, var d, 0, var hdr, 0, 1, 80), -1)
+    test.assert_eq(lowfrag.frag_first(var out, var d, 301, var hdr, 48, 1, 80), -1)
+    test.case("covered past the size, or negative")
+    test.assert_eq(lowfrag.frag_first(var out, var d, 300, var hdr, 301, 1, 80), -1)
+    test.assert_eq(lowfrag.frag_first(var out, var d, 300, var hdr, -1, 1, 80), -1)
+    test.case("a budget that does not hold the headers")
+    test.assert_eq(lowfrag.frag_first(var out, var d, 300, var hdr, 48, 1, 12), -1)
+    test.case("covered 44 with room for 2 more bytes cannot reach an eight-byte boundary: 46 rounds down to 40")
+    test.assert_eq(lowfrag.frag_first(var out, var d, 300, var hdr, 44, 1, 4 + 9 + 2), -1)
+    test.case("a datagram that fits whole is one fragment ending at its size")
+    test.assert_eq(lowfrag.frag_first(var out, var d, 60, var hdr, 48, 1, 80), 60)
+    test.case("a budget past the frame's own capacity is cut to it")
+    test.assert_eq(lowfrag.frag_first(var out, var d, 300, var hdr, 48, 1, 4000),
+        48 + 128 - 13 - (128 - 13 + 48) % 8)
+    test.assert_eq(out.len(), 128 - (128 - 13 + 48) % 8)
+
+@test
+fn test_the_next_fragment_refuses_what_cannot_follow() [io]
+    var d = load_dg(datagram_hex())
+    var out: Vec[u8; 128] = Vec.new()
+    test.case("done is not a multiple of eight")
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, 100, 80), -1)
+    test.case("done is zero, negative, at the size or past it")
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, 0, 80), -1)
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, -8, 80), -1)
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, 304, 80), -1)
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, 300, 80), -1)
+    test.case("a size of zero, past 2047, or past the buffer")
+    test.assert_eq(lowfrag.frag_next(var out, var d, 0, 1, 8, 80), -1)
+    test.assert_eq(lowfrag.frag_next(var out, var d, 2048, 1, 8, 80), -1)
+    test.assert_eq(lowfrag.frag_next(var out, var d, 301, 1, 8, 80), -1)
+    test.case("a budget that holds the header and under eight bytes")
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, 112, 5 + 7), -1)
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, 112, 5 + 8), 120)
+    test.case("a budget past the frame's own capacity is cut to it")
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, 112, 4000), 112 + 120)
+    test.case("the last fragment may be any length")
+    test.assert_eq(lowfrag.frag_next(var out, var d, 300, 1, 296, 80), 300)
+    test.assert_eq(out.len(), 5 + 4)
+
+// ── receiving ───────────────────────────────────────────────────────
+
+fn feed(var r: Reassembly, frame: Str, key: Int) -> Int
+    var t = lowctx.ctx_table()
+    var f = load_fr(frame)
+    lowfrag.reasm_input(var r, key, var f, 0, var t, s1(), s2())
+
+@test
+fn test_fragments_in_order_complete_the_datagram() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    test.assert_eq(r.active, false)
+    test.assert_eq(feed(var r, fr[0], 7), lowfrag.SIXLO_FRAG_PENDING)
+    test.assert_eq(r.active, true)
+    test.assert_eq(r.received, 112)
+    test.assert_eq(feed(var r, fr[1], 7), lowfrag.SIXLO_FRAG_PENDING)
+    test.assert_eq(feed(var r, fr[2], 7), lowfrag.SIXLO_FRAG_PENDING)
+    test.assert_eq(r.received, 256)
+    test.assert_eq(feed(var r, fr[3], 7), lowfrag.SIXLO_FRAG_COMPLETE)
+    test.assert_eq(r.received, 300)
+    test.assert_eq(r.size, 300)
+    test.assert_eq_str(dg_hex(var r.buf), datagram_hex())
+    test.case("reset frees the buffer")
+    lowfrag.reasm_reset(var r)
+    test.assert_eq(r.active, false)
+    test.assert_eq(r.buf.len(), 0)
+
+@test
+fn test_later_fragments_may_arrive_in_any_order_after_the_first() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    test.assert_eq(feed(var r, fr[0], 7), lowfrag.SIXLO_FRAG_PENDING)
+    test.assert_eq(feed(var r, fr[3], 7), lowfrag.SIXLO_FRAG_PENDING)
+    test.assert_eq(feed(var r, fr[1], 7), lowfrag.SIXLO_FRAG_PENDING)
+    test.assert_eq(feed(var r, fr[2], 7), lowfrag.SIXLO_FRAG_COMPLETE)
+    test.assert_eq_str(dg_hex(var r.buf), datagram_hex())
+
+@test
+fn test_a_fragment_that_arrives_twice_changes_nothing() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    let _a = feed(var r, fr[0], 7)
+    let _b = feed(var r, fr[1], 7)
+    test.case("the first again, and a later one again")
+    test.assert_eq(feed(var r, fr[0], 7), lowfrag.SIXLO_FRAG_DUPLICATE)
+    test.assert_eq(feed(var r, fr[1], 7), lowfrag.SIXLO_FRAG_DUPLICATE)
+    test.assert_eq(r.received, 184)
+    test.case("a fragment after completion is a duplicate and the datagram stays")
+    let _c = feed(var r, fr[2], 7)
+    test.assert_eq(feed(var r, fr[3], 7), lowfrag.SIXLO_FRAG_COMPLETE)
+    test.assert_eq(feed(var r, fr[3], 7), lowfrag.SIXLO_FRAG_DUPLICATE)
+    test.assert_eq(r.received, 300)
+
+@test
+fn test_fragments_that_overlap_and_differ_discard_the_datagram() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    let _a = feed(var r, fr[0], 7)
+    let _b = feed(var r, fr[1], 7)
+    test.case("a fragment over units 22 and 23, of which 22 is held: 16 bytes at offset 176")
+    let over = "e12cbeef16" + pattern(176, 192)
+    test.assert_eq(feed(var r, over, 7), lowfrag.SIXLO_FRAG_DROPPED)
+    test.assert_eq(r.active, false)
+    test.assert_eq(r.received, 0)
+    test.case("the buffer is free for the same datagram again")
+    test.assert_eq(feed(var r, fr[0], 7), lowfrag.SIXLO_FRAG_PENDING)
+
+@test
+fn test_a_fragment_of_another_datagram_does_not_disturb_the_one_in_progress() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    let _a = feed(var r, fr[0], 7)
+    test.case("another sender")
+    test.assert_eq(feed(var r, fr[1], 8), lowfrag.SIXLO_FRAG_BUSY)
+    test.case("another tag: the first fragment of tag 0xbef0")
+    let other = "c12cbef0" + "7e33f016331634abcd" + pattern(48, 112)
+    test.assert_eq(feed(var r, other, 7), lowfrag.SIXLO_FRAG_BUSY)
+    test.case("the datagram in progress is as it was")
+    test.assert_eq(r.received, 112)
+    test.assert_eq(r.tag, 0xBEEF)
+
+@test
+fn test_a_size_that_changes_under_one_tag_discards_the_datagram() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    let _a = feed(var r, fr[0], 7)
+    test.case("the same tag and a datagram_size of 301")
+    test.assert_eq(feed(var r, "e12d" + "beef" + "0e" + pattern(112, 184), 7), lowfrag.SIXLO_FRAG_DROPPED)
+    test.assert_eq(r.active, false)
+
+@test
+fn test_a_later_fragment_with_no_first_fragment_is_not_kept() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    test.assert_eq(feed(var r, fr[1], 7), lowfrag.SIXLO_FRAG_NO_FIRST)
+    test.assert_eq(r.active, false)
+
+@test
+fn test_a_fragment_that_cannot_be_read_changes_nothing() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    test.case("an empty frame, and a frame that is not a fragment")
+    test.assert_eq(feed(var r, "", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.assert_eq(feed(var r, "7a333a", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("a datagram_size past what the buffer holds: 1281")
+    test.assert_eq(feed(var r, "c501" + "beef" + "7a333a", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("a first fragment with nothing after the header, and one with HC1 after it")
+    test.assert_eq(feed(var r, "c12cbeef", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.assert_eq(feed(var r, "c12cbeef42aabb", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("a first fragment whose headers do not expand: a reserved NHC")
+    test.assert_eq(feed(var r, "c12cbeef7e3300", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.assert_eq(r.active, false)
+    test.assert_eq(r.buf.len(), 0)
+    test.case("a first fragment that expands to a length that is not a multiple of eight")
+    test.assert_eq(feed(var r, "c12cbeef" + "7a333a" + "aabbcc", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("an uncompressed header shorter than 40 bytes")
+    test.assert_eq(feed(var r, "c12cbeef41" + "6000", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("an expansion longer than the datagram_size")
+    test.assert_eq(feed(var r, "c01e" + "beef" + "7a333a" + "aabbcc", 7), lowfrag.SIXLO_FRAG_BAD)
+    let _a = feed(var r, fr[0], 7)
+    test.case("a later fragment at offset zero")
+    test.assert_eq(feed(var r, "e12cbeef00" + pattern(0, 8), 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("a later fragment that ends past the datagram: 72 bytes at offset 256")
+    test.assert_eq(feed(var r, "e12cbeef20" + pattern(256, 328), 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("a later fragment, not the last, whose length is not a multiple of eight: 20 bytes at 112")
+    test.assert_eq(feed(var r, "e12cbeef0e" + pattern(112, 132), 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("a later fragment with no payload")
+    test.assert_eq(feed(var r, "e12cbeef0e", 7), lowfrag.SIXLO_FRAG_BAD)
+    test.case("none of these disturbed the datagram")
+    test.assert_eq(r.received, 112)
+
+@test
+fn test_a_first_fragment_may_carry_an_uncompressed_ipv6_header() [io]
+    // Dispatch 01000001 then the 40-byte header and 16 bytes of the 100-byte datagram.
+    let hdr = h2(0x60) + "000000" + h4(60) + "3b" + "40" + a1() + a2()
+    let datagram = hdr + pattern(40, 100)
+    var r = lowfrag.reasm_new()
+    test.assert_eq(feed(var r, "c064" + "1234" + "41" + hdr + pattern(40, 56), 3), lowfrag.SIXLO_FRAG_PENDING)
+    test.assert_eq(r.received, 56)
+    test.assert_eq(feed(var r, "e064" + "1234" + "07" + pattern(56, 100), 3), lowfrag.SIXLO_FRAG_COMPLETE)
+    test.assert_eq_str(dg_hex(var r.buf), datagram)
+
+@test
+fn test_an_elided_udp_checksum_is_put_back_when_the_datagram_is_whole() [io]
+    var t = lowctx.ctx_table()
+    // A UDP datagram of 100 bytes with a correct checksum, compressed with the checksum elided.
+    var d = load_dg(h2(0x60) + "000000" + h4(60) + "11" + "40" + a1() + a2() + "16331634" + h4(60) + "0000" + pattern(48, 100))
+    let c = lowcsum.udp_checksum(var d, 0, 40, 60)
+    d[46] = (c >> 8) as u8
+    d[47] = (c & 0xFF) as u8
+    var hdr: Vec[u8; 128] = Vec.new()
+    let p = lowiphc.compress(var d, 100, s1(), s2(), var t, true, var hdr)
+    test.assert_eq(p.status, lowiphc.IPHC_OK)
+    var out: Vec[u8; 128] = Vec.new()
+    let done = lowfrag.frag_first(var out, var d, 100, var hdr, p.covered, 0x0042, 60)
+    test.assert_eq(done > 0 and done < 100, true)
+    var r = lowfrag.reasm_new()
+    var f = out
+    test.assert_eq(lowfrag.reasm_input(var r, 1, var f, 0, var t, s1(), s2()), lowfrag.SIXLO_FRAG_PENDING)
+    test.assert_eq(r.udp_off, 40)
+    var out2: Vec[u8; 128] = Vec.new()
+    let end = lowfrag.frag_next(var out2, var d, 100, 0x0042, done, 80)
+    test.assert_eq(end, 100)
+    var g = out2
+    test.assert_eq(lowfrag.reasm_input(var r, 1, var g, 0, var t, s1(), s2()), lowfrag.SIXLO_FRAG_COMPLETE)
+    test.assert_eq(r.udp_off, -1)
+    test.assert_eq(lowcsum.udp_checksum_ok(var r.buf, 0, 40, 60), true)
+    test.assert_eq_str(dg_hex(var r.buf), dg_hex(var d))
+
+// ── the timer ───────────────────────────────────────────────────────
+
+@test
+fn test_a_reassembly_ends_sixty_seconds_after_its_first_fragment() [io]
+    let fr = fragments()
+    var r = lowfrag.reasm_new()
+    test.case("an idle buffer has nothing to time out")
+    test.assert_eq(lowfrag.reasm_tick(var r, 100000), false)
+    let _a = feed(var r, fr[0], 7)
+    test.case("59 999 ms is not enough, one more is")
+    test.assert_eq(lowfrag.reasm_tick(var r, 59999), false)
+    test.assert_eq(r.active, true)
+    test.assert_eq(lowfrag.reasm_tick(var r, 1), true)
+    test.assert_eq(r.active, false)
+    test.assert_eq(r.received, 0)
+    test.case("the timer is counted from the first fragment, whatever arrives between")
+    let _b = feed(var r, fr[0], 7)
+    test.assert_eq(lowfrag.reasm_tick(var r, 30000), false)
+    let _c = feed(var r, fr[1], 7)
+    test.assert_eq(r.age_ms, 30000)
+    test.assert_eq(lowfrag.reasm_tick(var r, 30000), true)
+    test.case("time passing in small steps adds up")
+    let _d = feed(var r, fr[0], 7)
+    var timed_out = false
+    for _i in 0..61
+        if lowfrag.reasm_tick(var r, 1000)
+            timed_out = true
+    test.assert_eq(timed_out, true)
+    test.assert_eq(lowfrag.SIXLO_REASM_TIMEOUT_MS, 60000)

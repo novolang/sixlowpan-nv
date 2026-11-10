@@ -1,0 +1,106 @@
+// lowcsum.nv — the Internet checksum of a UDP datagram over IPv6.
+//
+// 6LoWPAN may drop the UDP checksum from the wire when the upper layer
+// authorises it (RFC 6282 section 4.3.2), and the node that expands the
+// packet has to compute the value it left out.  The checksum is the 16-bit
+// one's complement of the one's complement sum of a pseudo-header, the UDP
+// header with its checksum field taken as zero, and the payload (RFC 768,
+// with the IPv6 pseudo-header of RFC 8200 section 8.1):
+//
+//   source address (16 bytes), destination address (16 bytes),
+//   upper-layer length (4 bytes), zeros (3 bytes), next header 17 (1 byte).
+//
+// A checksum that comes out as zero is sent as 0xFFFF, because zero means
+// "no checksum" for UDP over IPv4 and is not allowed over IPv6.
+//
+// The addresses are read from the IPv6 header of the datagram.  A routing
+// header changes the destination the pseudo-header uses (RFC 8200 section
+// 8.1); this module does not follow it.
+
+use lowpan
+
+// The sum of the 16-bit words of `len` bytes of the datagram from `from`,
+// added to `init`, big-endian, not yet folded.  A final odd byte is the high
+// byte of a word padded with zero.
+//
+// ```novo
+// use lowpan
+// use lowcsum
+//
+// fn main() [io]
+//     var d: Vec[u8; 1280] = Vec.new()
+//     for b in [0x00, 0x01, 0x00, 0x02, 0x03]
+//         let _p = d.push(b as u8)
+//     println("${lowcsum.sum16(var d, 0, 5, 0)}")   // 771, that is 1 + 2 + 0x0300
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sum16(var d: Datagram, from: Int, len: Int, init: Int) -> Int []
+    var s = init
+    let words = len / 2
+    for i in 0..words
+        let at = from + 2 * i
+        s = s + ((d[at] as Int << 8) | d[at + 1] as Int)
+    if (len & 1) == 1
+        s = s + (d[from + len - 1] as Int << 8)
+    s
+
+// A sum folded to 16 bits: the carries out of the top added back in until
+// none remain.
+pub @tier(embedded)
+@no_alloc
+fn fold(sum: Int) -> Int []
+    var s = sum
+    for _i in 0..4
+        s = (s & 0xFFFF) + (s >> 16)
+    s
+
+// The sum of the pseudo-header for the IPv6 header at `ip_off` and an
+// upper-layer length of `len` bytes, next header 17.
+@tier(embedded)
+@no_alloc
+fn pseudo_sum(var d: Datagram, ip_off: Int, len: Int) -> Int
+    let addrs = sum16(var d, ip_off + 8, 32, 0)
+    addrs + (len >> 16) + (len & 0xFFFF) + 17
+
+// The UDP checksum of the datagram whose IPv6 header is at `ip_off` and
+// whose UDP header is at `udp_off`, `udp_len` bytes of it, the checksum
+// field in the header read as zero.  The value to put on the wire: 0xFFFF
+// where the arithmetic gives zero.
+//
+// ```novo
+// use lowcsum
+//
+// fn main() [io]
+//     // An IPv6 header from ::1 to ::1 and a UDP header with 4 payload bytes.
+//     var d: Vec[u8; 1280] = Vec.new()
+//     for _a in 0..8
+//         let _p = d.push(0)
+//     for _b in 0..15
+//         let _q = d.push(0)
+//     let _r = d.push(1)
+//     for _c in 0..15
+//         let _s = d.push(0)
+//     let _t = d.push(1)
+//     for b in [0x16, 0x2e, 0x16, 0x2e, 0x00, 0x0c, 0x00, 0x00, 1, 2, 3, 4]
+//         let _u = d.push(b as u8)
+//     println("${lowcsum.udp_checksum(var d, 0, 40, 12)}")   // 53106
+// ```
+pub @tier(embedded)
+@no_alloc
+fn udp_checksum(var d: Datagram, ip_off: Int, udp_off: Int, udp_len: Int) -> Int []
+    let head = sum16(var d, udp_off, 6, 0)
+    let tail = sum16(var d, udp_off + 8, udp_len - 8, 0)
+    let all = fold(pseudo_sum(var d, ip_off, udp_len) + head + tail)
+    let c = 0xFFFF - all
+    if c == 0
+        0xFFFF
+    else
+        c
+
+// Whether the checksum already in the UDP header is the right one.
+pub @tier(embedded)
+@no_alloc
+fn udp_checksum_ok(var d: Datagram, ip_off: Int, udp_off: Int, udp_len: Int) -> Bool []
+    let stored = (d[udp_off + 6] as Int << 8) | d[udp_off + 7] as Int
+    stored == udp_checksum(var d, ip_off, udp_off, udp_len)

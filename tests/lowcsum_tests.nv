@@ -1,0 +1,86 @@
+// lowcsum_tests.nv — the Internet checksum of a UDP datagram over IPv6.
+//
+// The checksum vectors are derived by hand.  The datagram is an IPv6 header
+// from ::1 to ::1 and a UDP header 0x162e to 0x162e with a payload of
+// 01 02 03 04, and the one's complement sum is
+//
+//   pseudo-header   addresses 1 + 1, length 12, next header 17   = 31
+//   UDP header      0x162e + 0x162e + 0x000c + checksum field 0  = 0x2c5c + 0x0c = 11368
+//   payload         0x0102 + 0x0304                              = 1030
+//                                                          total = 12429 = 0x308d
+//
+// and the checksum is 0xFFFF - 0x308d = 0xcf72, which is 53106.
+
+use std.test
+use lowpan
+use lowcsum
+
+fn payload_datagram() -> Vec[u8; 1280]
+    var d: Vec[u8; 1280] = Vec.new()
+    for _a in 0..8
+        let _p = d.push(0)
+    for _b in 0..15
+        let _q = d.push(0)
+    let _r = d.push(1)
+    for _c in 0..15
+        let _s = d.push(0)
+    let _t = d.push(1)
+    for b in [0x16, 0x2E, 0x16, 0x2E, 0x00, 0x0C, 0x00, 0x00, 1, 2, 3, 4]
+        let _u = d.push(b as u8)
+    d
+
+@test
+fn test_the_sum_adds_big_endian_words_and_pads_an_odd_byte() [io]
+    var d: Vec[u8; 1280] = Vec.new()
+    for b in [0x00, 0x01, 0x00, 0x02, 0x03]
+        let _p = d.push(b as u8)
+    test.case("1 + 2 + 0x0300 = 771")
+    test.assert_eq(lowcsum.sum16(var d, 0, 5, 0), 771)
+    test.case("an even length stops before the odd byte")
+    test.assert_eq(lowcsum.sum16(var d, 0, 4, 0), 3)
+    test.case("the start value is added")
+    test.assert_eq(lowcsum.sum16(var d, 0, 4, 100), 103)
+    test.case("a window from an offset")
+    test.assert_eq(lowcsum.sum16(var d, 2, 2, 0), 2)
+    test.case("nothing to add")
+    test.assert_eq(lowcsum.sum16(var d, 0, 0, 7), 7)
+
+@test
+fn test_carries_are_folded_back_into_sixteen_bits() [io]
+    test.case("below 16 bits nothing changes")
+    test.assert_eq(lowcsum.fold(0x1234), 0x1234)
+    test.case("0x1_0001 folds to 2")
+    test.assert_eq(lowcsum.fold(0x10001), 2)
+    test.case("0x1_FFFF folds to 0x1_0000 and then to 1")
+    test.assert_eq(lowcsum.fold(0x1FFFF), 1)
+    test.case("a sum of many words")
+    test.assert_eq(lowcsum.fold(0xFFFF * 40), 0xFFFF)
+
+@test
+fn test_the_udp_checksum_of_a_small_datagram_is_derived_by_hand() [io]
+    var d = payload_datagram()
+    test.case("0xFFFF - 0x308d = 0xcf72")
+    test.assert_eq(lowcsum.udp_checksum(var d, 0, 40, 12), 0xCF72)
+    test.case("a header with the right checksum is ok, and one with another is not")
+    d[46] = 0xCF
+    d[47] = 0x72
+    test.assert_eq(lowcsum.udp_checksum_ok(var d, 0, 40, 12), true)
+    d[47] = 0x73
+    test.assert_eq(lowcsum.udp_checksum_ok(var d, 0, 40, 12), false)
+    test.case("the checksum field is read as zero while the checksum is computed")
+    test.assert_eq(lowcsum.udp_checksum(var d, 0, 40, 12), 0xCF72)
+
+@test
+fn test_a_checksum_that_comes_out_as_zero_is_sent_as_ffff() [io]
+    // Two more payload bytes 0xcf 0x6e: the UDP length and the pseudo-header
+    // length are both 14 now, so the sum is 11356 + 14 + 1030 + 53102 + 33
+    // = 65535, whose complement is zero.
+    var d = payload_datagram()
+    let _a = d.push(0xCF)
+    let _b = d.push(0x6E)
+    d[44] = 0x00
+    d[45] = 0x0E
+    test.assert_eq(lowcsum.udp_checksum(var d, 0, 40, 14), 0xFFFF)
+    d[46] = 0xFF
+    d[47] = 0xFF
+    test.assert_eq(lowcsum.udp_checksum_ok(var d, 0, 40, 14), true)

@@ -1,0 +1,158 @@
+// tests/embedded_probe.nv — the device claim of sixlowpan-nv, as a program that
+// either builds for a Cortex-M or does not.
+//
+// The shard audit's `core-embedded` row copies this and the modules of the
+// package into a package of its own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.  `--target=nrf52-qemu` checks
+// every function it compiles at `@tier(embedded)`, so a heap allocation or an
+// unbounded loop anywhere in the package is refused.
+//
+// The firmware is a border node between an IEEE 802.15.4 network and a host.
+// It reads a frame that carries a mesh header and a compressed UDP datagram,
+// expands the datagram and checks it, compresses it again and checks that it
+// gives the same bytes; then it sends a 300-byte datagram as four fragments,
+// takes the fragments back in a different order into a reassembly buffer, and
+// checks the datagram it gets and the timer that frees the buffer.
+
+use lowpan
+use lowctx
+use lowiphc
+use lowfrag
+
+// A mesh header (5 bytes: hops left 5, originator 0x0001, destination 0x0002)
+// and a LOWPAN_IPHC UDP packet: traffic class and flow label elided, hop limit
+// 64, both addresses elided, ports 0xf0b1 and 0xf0b2, the checksum in-line,
+// and four payload bytes.
+const MESH_FRAME = [
+    0xb5, 0x00, 0x01, 0x00, 0x02,
+    0x7e, 0x33, 0xf3, 0x12, 0xab, 0xcd, 0xde, 0xad, 0xbe, 0xef]
+
+// Append a byte.
+@tier(embedded)
+@no_alloc
+fn put(var d: Datagram, b: Int)
+    let _p = d.push(b as u8)
+
+// Write the IPv6 and UDP headers of a datagram of `size` bytes, from the link
+// local address of short address 1 to that of short address 2, ports 5683 and
+// 5684, and the payload pattern "byte i is the low byte of i".
+@tier(embedded)
+@no_alloc
+fn build(var d: Datagram, size: Int)
+    d.clear()
+    let plen = size - 40
+    put(var d, 0x60)
+    put(var d, 0)
+    put(var d, 0)
+    put(var d, 0)
+    put(var d, plen >> 8)
+    put(var d, plen & 0xFF)
+    put(var d, 17)
+    put(var d, 64)
+    for k in 0..2
+        for i in 0..16
+            var b = 0
+            if i == 0
+                b = 0xFE
+            else if i == 1
+                b = 0x80
+            else if i == 11
+                b = 0xFF
+            else if i == 12
+                b = 0xFE
+            else if i == 15
+                b = k + 1
+            put(var d, b)
+    put(var d, 0x16)
+    put(var d, 0x33)
+    put(var d, 0x16)
+    put(var d, 0x34)
+    put(var d, plen >> 8)
+    put(var d, plen & 0xFF)
+    put(var d, 0x12)
+    put(var d, 0x34)
+    for i in 48..size
+        put(var d, i & 0xFF)
+
+// Everything the firmware decides, folded into one number: a single comparison
+// on the device decides the run, so a passing run means every step came out
+// right and not only that the calls linked.
+@tier(embedded)
+@no_alloc
+fn score() -> Int
+    var n = 0
+    var t = lowctx.ctx_table()
+    let s1 = lowpan.ll_short(1)
+    let s2 = lowpan.ll_short(2)
+
+    // ── a frame in ─────────────────────────────────────────────────────
+    var f: Frame = Vec.new()
+    for i in 0..15
+        let _p = f.push(MESH_FRAME[i] as u8)
+    let v = lowpan.inspect(var f)
+    if v.status == lowpan.SIXLO_VIEW_OK and v.has_mesh and v.mesh.hops_left == 5 and v.payload_kind == lowpan.SIXLO_KIND_IPHC
+        n = n + 1
+    var d: Datagram = Vec.new()
+    let u = lowiphc.decompress(var f, v.payload_off, -1, s1, s2, var t, var d)
+    if u.status == lowiphc.IPHC_OK and u.size == 52 and u.udp_off == 40 and d[6] == 17 and d[7] == 64
+        n = n + 1
+    if d[40] == 0xF0 and d[41] == 0xB1 and d[44] == 0 and d[45] == 12 and d[48] == 0xDE and d[51] == 0xEF
+        n = n + 1
+
+    // ── and the same datagram out again ────────────────────────────────
+    var out: Frame = Vec.new()
+    let len = lowiphc.pack_frame(var d, u.size, s1, s2, var t, false, 127, var out)
+    if len == 10 and out[0] == 0x7E and out[2] == 0xF3 and out[9] == 0xEF
+        n = n + 1
+
+    // ── a datagram too big for one frame, in four fragments ────────────
+    var big: Datagram = Vec.new()
+    build(var big, 300)
+    var hdr: Frame = Vec.new()
+    let p = lowiphc.compress(var big, 300, s1, s2, var t, false, var hdr)
+    // workaround(a-vec-of-an-alias-imported-from-another-module-is-not-resolved): a Vec of an imported alias is not built, so the element is spelled out
+    var frames: Vec[Vec[u8; 128]; 4] = Vec.new()
+    var done = lowfrag.frag_first(var out, var big, 300, var hdr, p.covered, 0xBEEF, 80)
+    let _a = frames.push(out)
+    for _i in 0..3
+        if done > 0 and done < 300
+            done = lowfrag.frag_next(var out, var big, 300, 0xBEEF, done, 80)
+            let _b = frames.push(out)
+    if done == 300 and frames.len() == 4
+        n = n + 1
+
+    // ── and back, the first fragment first and the rest out of order ───
+    var r = lowfrag.reasm_new()
+    var g = frames[0]
+    var code = lowfrag.reasm_input(var r, 7, var g, 0, var t, s1, s2)
+    var h = frames[3]
+    code = lowfrag.reasm_input(var r, 7, var h, 0, var t, s1, s2)
+    var j = frames[1]
+    code = lowfrag.reasm_input(var r, 7, var j, 0, var t, s1, s2)
+    var k = frames[2]
+    code = lowfrag.reasm_input(var r, 7, var k, 0, var t, s1, s2)
+    if code == lowfrag.SIXLO_FRAG_COMPLETE and r.size == 300
+        n = n + 1
+    var same = true
+    for i in 0..300
+        if r.buf[i] != big[i]
+            same = false
+    if same
+        n = n + 1
+
+    // ── and the timer ──────────────────────────────────────────────────
+    lowfrag.reasm_reset(var r)
+    var m = frames[0]
+    let _c = lowfrag.reasm_input(var r, 7, var m, 0, var t, s1, s2)
+    if not lowfrag.reasm_tick(var r, 59999) and lowfrag.reasm_tick(var r, 1) and not r.active
+        n = n + 1
+    n
+
+fn main() [hw]
+    if score() == 8
+        hal.uart.write("PASS: sixlowpan-embedded\n")
+    else
+        hal.uart.write("FAIL: sixlowpan-embedded\n")

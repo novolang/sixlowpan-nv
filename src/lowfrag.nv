@@ -1,0 +1,433 @@
+// lowfrag.nv — fragmentation and reassembly, RFC 4944 section 5.3.
+//
+// An IPv6 datagram of up to 1280 bytes does not fit one IEEE 802.15.4 frame,
+// so 6LoWPAN breaks it into link fragments.  The first fragment starts with
+// a four-byte header and the later ones with five:
+//
+//    1 1 0 0 0 | datagram_size (11 bits) | datagram_tag (16 bits)            FRAG1
+//    1 1 1 0 0 | datagram_size (11 bits) | datagram_tag | datagram_offset    FRAGN
+//
+// `datagram_size` is the size of the whole datagram before compression and
+// before fragmentation, the same in every fragment.  `datagram_tag` names
+// the datagram and is the same in every fragment; the sender increments it
+// for each datagram it fragments and it wraps at 65536.  `datagram_offset`
+// is where the fragment's payload begins in the datagram, counted in units
+// of eight bytes, and the offset of the first fragment is zero.  Every
+// fragment but the last carries a multiple of eight bytes, because the
+// offset cannot express anything else.
+//
+// WHAT IS COUNTED IN WHICH FORM.  The first fragment carries the header in
+// its compressed form (RFC 6282), and `datagram_size` and every offset count
+// the datagram as it is after expansion.  So the number of bytes a first
+// fragment stands for is not the number of bytes it holds; `frag_first`
+// takes the length the compressed headers stand for, and `reasm_input` finds
+// out by expanding them.
+//
+// THE SENDER is stateless: `frag_first` builds the first fragment and says
+// how far into the datagram it reached, `frag_next` builds the next from
+// where the last stopped.  The caller owns the tag and the frames.
+//
+// THE RECEIVER is `Reassembly`, one datagram in progress in a buffer of
+// 1280 bytes, with the timer of section 5.3 as a step the caller drives:
+// `reasm_tick` is told how many milliseconds passed and frees the buffer
+// when 60 seconds have gone since the first fragment.  A node that takes
+// several datagrams at once keeps several, and gives a fragment to the one
+// whose `key`, tag and size match.
+//
+// WHAT IS NOT DONE.
+// - A later fragment that arrives before the first is not kept.  The first
+//   fragment is what says how long the compressed headers expand to, so the
+//   buffer is started by it.  RFC 4944 permits an implementation to keep an
+//   earlier one; this package leaves the datagram to the layers above, which
+//   lose it as they lose any datagram on a lossy link.
+// - A fragment that overlaps one already held and differs from it discards
+//   the datagram, as section 5.3 requires.  A fresh reassembly is not
+//   started from the fragment that caused it.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+
+use lowpan
+use lowctx
+use lowiphc
+
+// The size of a first fragment's header.
+pub const SIXLO_FRAG1_HDR = 4
+// The size of a later fragment's header.
+pub const SIXLO_FRAGN_HDR = 5
+// The largest datagram_size, the 11-bit field's maximum.
+pub const SIXLO_FRAG_SIZE_MAX = 2047
+// How long a reassembly may take from its first fragment: 60 seconds.
+pub const SIXLO_REASM_TIMEOUT_MS = 60000
+
+// A fragment was kept and the datagram is not complete.
+pub const SIXLO_FRAG_PENDING = 0
+// The fragment completed the datagram: it is in `Reassembly.buf`.
+pub const SIXLO_FRAG_COMPLETE = 1
+// The fragment is a copy of one already held and changed nothing.
+pub const SIXLO_FRAG_DUPLICATE = 2
+// The datagram was discarded: its fragments disagree.
+pub const SIXLO_FRAG_DROPPED = 3
+// The buffer holds a different datagram and the fragment was not kept.
+pub const SIXLO_FRAG_BUSY = 4
+// The fragment is malformed and nothing changed.
+pub const SIXLO_FRAG_BAD = 5
+// A later fragment came with no first fragment held and was not kept.
+pub const SIXLO_FRAG_NO_FIRST = 6
+
+// A fragment header read.
+//
+// `ok` is false for a header that is not a fragment header, runs past the
+// frame or gives a datagram_size of zero.  `first` says FRAG1.  `offset` is
+// the offset in bytes, already multiplied by eight, and 0 for a first
+// fragment.  `hdr_len` is the header's size, 4 or 5.
+pub @value
+struct FragHeader
+    ok: Bool
+    first: Bool
+    size: Int
+    tag: Int
+    offset: Int
+    hdr_len: Int
+
+// The header of a fragment that is not one.
+@tier(embedded)
+@no_alloc
+fn no_header() -> FragHeader
+    FragHeader { ok: false, first: false, size: 0, tag: 0, offset: 0, hdr_len: 0 }
+
+// Read the fragment header at `at`.
+//
+// ```novo
+// use lowfrag
+//
+// fn main() [io]
+//     // FRAG1, datagram_size 0x2ab (683), datagram_tag 0x0102.
+//     var f: Vec[u8; 128] = Vec.new()
+//     for b in [0xc2, 0xab, 0x01, 0x02]
+//         let _p = f.push(b as u8)
+//     let h = lowfrag.frag_header(var f, 0)
+//     println("${h.ok} ${h.first} ${h.size} ${h.tag} ${h.offset}")   // true true 683 258 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn frag_header(var f: Frame, at: Int) -> FragHeader []
+    if at < 0 or at + 4 > f.len()
+        return no_header()
+    let b0 = f[at] as Int
+    let first = (b0 & 0xF8) == 0xC0
+    let next = (b0 & 0xF8) == 0xE0
+    if not first and not next
+        return no_header()
+    let size = ((b0 & 7) << 8) | f[at + 1] as Int
+    let tag = (f[at + 2] as Int << 8) | f[at + 3] as Int
+    if size == 0
+        return no_header()
+    if first
+        return FragHeader { ok: true,
+            first: true,
+            size: size,
+            tag: tag,
+            offset: 0,
+            hdr_len: SIXLO_FRAG1_HDR }
+    if at + 5 > f.len()
+        return no_header()
+    FragHeader { ok: true, first: false, size: size, tag: tag, offset: f[at + 4] as Int * 8,
+                 hdr_len: SIXLO_FRAGN_HDR }
+
+// ── Sending ──────────────────────────────────────────────────────────
+
+// Append a byte to a frame.  The callers have cut their room to the frame's
+// capacity, so the push is never refused and the result is not looked at.
+@tier(embedded)
+@no_alloc
+fn put(var out: Frame, b: Int)
+    let _p = out.push((b & 0xFF) as u8)
+
+// Append the two-byte head every fragment header starts with: the dispatch
+// bits, the datagram_size and the tag.
+@tier(embedded)
+@no_alloc
+fn put_head(var out: Frame, dispatch: Int, size: Int, tag: Int)
+    put(var out, dispatch | ((size >> 8) & 7))
+    put(var out, size)
+    put(var out, tag >> 8)
+    put(var out, tag)
+
+// Build the first fragment of a datagram.
+//
+// `d` holds the datagram of `size` bytes before compression.  `hdr` holds
+// its compressed headers (`lowiphc.compress`) and `covered` is the number of
+// bytes of the datagram they stand for.  `tag` is the datagram_tag.  `budget`
+// is the most bytes the frame's payload may hold.  The fragment is written
+// to `out`, emptied first: the four-byte header, the compressed headers, and
+// as much of the payload after `covered` as fits and leaves the next
+// fragment on an eight-byte boundary.
+//
+// Answers the number of bytes of the datagram the fragment reached, which is
+// the `done` to hand to `frag_next`; or -1 when nothing can be built: a size
+// over 2047, headers that are longer than the budget, or no way to reach an
+// eight-byte boundary.
+//
+// ```novo
+// use lowfrag
+//
+// fn main() [io]
+//     // A 100-byte datagram whose 40-byte header compressed to 2 bytes.
+//     var d: Vec[u8; 1280] = Vec.new()
+//     for i in 0..100
+//         let _p = d.push(i as u8)
+//     var hdr: Vec[u8; 128] = Vec.new()
+//     let _a = hdr.push(0x7a)
+//     let _b = hdr.push(0x33)
+//     var out: Vec[u8; 128] = Vec.new()
+//     println("${lowfrag.frag_first(var out, var d, 100, var hdr, 40, 7, 40)}")   // 72
+// ```
+pub @tier(embedded)
+@no_alloc
+fn frag_first(var out: Frame, var d: Datagram, size: Int, var hdr: Frame, covered: Int, tag: Int,
+              budget: Int) -> Int []
+    out.clear()
+    if size < 1 or size > SIXLO_FRAG_SIZE_MAX or size > d.len() or covered < 0 or covered > size
+        return -1
+    var room = budget - SIXLO_FRAG1_HDR - hdr.len()
+    if room > out.capacity() - SIXLO_FRAG1_HDR - hdr.len()
+        room = out.capacity() - SIXLO_FRAG1_HDR - hdr.len()
+    if room < 0
+        return -1
+    var reach = covered + room
+    if reach >= size
+        reach = size
+    else
+        reach = reach / 8 * 8
+    if reach < covered
+        return -1
+    put_head(var out, 0xC0, size, tag)
+    for i in 0..hdr.len()
+        put(var out, hdr[i] as Int)
+    for i in covered..reach
+        put(var out, d[i] as Int)
+    reach
+
+// Build the next fragment of a datagram.
+//
+// `done` is the number of bytes of the datagram already sent, a multiple of
+// eight, as `frag_first` or the last `frag_next` answered.  The fragment
+// holds the five-byte header and as many bytes of the datagram from `done`
+// as fit `budget` and leave the next fragment on an eight-byte boundary, or
+// the rest of the datagram when it fits.
+//
+// Answers the new `done`, which equals `size` after the last fragment, or -1
+// for a `done` that is not a multiple of eight or not inside the datagram, a
+// size over 2047, or a budget that cannot carry eight bytes.
+pub @tier(embedded)
+@no_alloc
+fn frag_next(var out: Frame, var d: Datagram, size: Int, tag: Int, done: Int, budget: Int) -> Int []
+    out.clear()
+    if size < 1 or size > SIXLO_FRAG_SIZE_MAX or size > d.len() or done <= 0 or done >= size or (done & 7) != 0
+        return -1
+    var room = budget
+    if room > out.capacity()
+        room = out.capacity()
+    room = room - SIXLO_FRAGN_HDR
+    var take = size - done
+    if room < take
+        take = room / 8 * 8
+    if take <= 0
+        return -1
+    put_head(var out, 0xE0, size, tag)
+    put(var out, done / 8)
+    for i in done..done + take
+        put(var out, d[i] as Int)
+    done + take
+
+// ── Receiving ────────────────────────────────────────────────────────
+
+// One datagram being reassembled.
+//
+// `active` says the buffer is in use.  `key` identifies the sender and the
+// destination of the fragments; the caller makes it from the link addresses
+// (or the mesh header's originator and final destination), and the package
+// only compares it.  `tag` and `size` are the datagram's.  `received` counts
+// the bytes of the datagram held, `age_ms` the time since the first fragment.
+// `buf` is the datagram, `size` bytes long once started.  `seen` has one
+// byte for each eight bytes of the datagram, 1 once held.  `udp_off` is the
+// index of the UDP header whose checksum was elided and is not yet put back,
+// or -1.
+pub @value
+struct Reassembly
+    active: Bool
+    key: Int
+    tag: Int
+    size: Int
+    received: Int
+    age_ms: Int
+    udp_off: Int
+    seen: Vec[u8; 160]
+    buf: Datagram
+
+// A buffer with no datagram in it.
+//
+// ```novo
+// use lowfrag
+//
+// fn main() [io]
+//     let r = lowfrag.reasm_new()
+//     println("${r.active} ${r.received}")   // false 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn reasm_new() -> Reassembly []
+    Reassembly { active: false, key: 0, tag: 0, size: 0, received: 0, age_ms: 0, udp_off: -1, seen: Vec.new(),
+                 buf: Vec.new() }
+
+// Give up the datagram in the buffer, finished or not.
+pub @tier(embedded)
+@no_alloc
+fn reasm_reset(var r: Reassembly) []
+    r.active = false
+    r.size = 0
+    r.received = 0
+    r.age_ms = 0
+    r.udp_off = -1
+    r.seen.clear()
+    r.buf.clear()
+
+// Tell the buffer that `elapsed_ms` milliseconds passed.  Answers true when
+// that ended a reassembly: 60 seconds after the first fragment, the datagram
+// is discarded and the buffer is free.
+pub @tier(embedded)
+@no_alloc
+fn reasm_tick(var r: Reassembly, elapsed_ms: Int) -> Bool []
+    if not r.active
+        return false
+    r.age_ms = r.age_ms + elapsed_ms
+    if r.age_ms >= SIXLO_REASM_TIMEOUT_MS
+        reasm_reset(var r)
+        return true
+    false
+
+// Mark the units of eight bytes from `from` to `to` as held.
+@tier(embedded)
+@no_alloc
+fn mark(var r: Reassembly, from: Int, to: Int)
+    for u in from / 8..(to + 7) / 8
+        r.seen[u] = 1
+
+// How many units of eight bytes the range holds.
+@tier(embedded)
+@no_alloc
+fn units(from: Int, to: Int) -> Int
+    (to + 7) / 8 - from / 8
+
+// Start the buffer on a first fragment.  The fragment's payload at `at`
+// is expanded or copied into the buffer, which is then extended with zeros
+// to the datagram's size.  Answers a `SIXLO_FRAG_*` code.
+@tier(embedded)
+@no_alloc
+fn start(var r: Reassembly, key: Int, h: FragHeader, var f: Frame, at: Int, var t: ContextTable,
+         src_ll: LinkAddr, dst_ll: LinkAddr) -> Int
+    if at >= f.len()
+        return SIXLO_FRAG_BAD
+    let kind = lowpan.kind_of(f[at] as Int)
+    var written = 0
+    var udp = -1
+    if kind == lowpan.SIXLO_KIND_IPHC
+        let u = lowiphc.decompress(var f, at, h.size, src_ll, dst_ll, var t, var r.buf)
+        if u.status != lowiphc.IPHC_OK
+            r.buf.clear()
+            return SIXLO_FRAG_BAD
+        written = u.written
+        if u.pending
+            udp = u.udp_off
+    else if kind == lowpan.SIXLO_KIND_IPV6
+        r.buf.clear()
+        for i in at + 1..f.len()
+            let _p = r.buf.push(f[i])
+        written = r.buf.len()
+    else
+        return SIXLO_FRAG_BAD
+    if written > h.size or written < h.size and (written & 7) != 0 or written < 40
+        r.buf.clear()
+        return SIXLO_FRAG_BAD
+    for _i in written..h.size
+        let _z = r.buf.push(0)
+    r.seen.clear()
+    for _u in 0..(h.size + 7) / 8
+        let _s = r.seen.push(0)
+    r.active = true
+    r.key = key
+    r.tag = h.tag
+    r.size = h.size
+    r.received = written
+    r.age_ms = 0
+    r.udp_off = udp
+    mark(var r, 0, written)
+    SIXLO_FRAG_PENDING
+
+// Put a later fragment's payload into the buffer at its offset.
+@tier(embedded)
+@no_alloc
+fn place(var r: Reassembly, h: FragHeader, var f: Frame) -> Int
+    let len = f.len() - h.hdr_len
+    let end = h.offset + len
+    if h.offset == 0 or len <= 0 or end > r.size or end < r.size and (len & 7) != 0
+        return SIXLO_FRAG_BAD
+    let held = units(h.offset, end)
+    var overlap = 0
+    for u in h.offset / 8..(end + 7) / 8
+        if r.seen[u] != 0
+            overlap = overlap + 1
+    if overlap == held
+        return SIXLO_FRAG_DUPLICATE
+    if overlap > 0
+        reasm_reset(var r)
+        return SIXLO_FRAG_DROPPED
+    for i in 0..len
+        r.buf[h.offset + i] = f[h.hdr_len + i]
+    mark(var r, h.offset, end)
+    r.received = r.received + len
+    SIXLO_FRAG_PENDING
+
+// Give the buffer a fragment.
+//
+// `f` is the frame's payload and `at` the index of its fragment header (after
+// any mesh or broadcast header, which `lowpan.inspect` skips).  `key` names
+// the sender and destination.  `t`, `src_ll` and `dst_ll` expand the first
+// fragment's compressed headers.
+//
+// Answers `SIXLO_FRAG_COMPLETE` when the datagram is whole, in `r.buf` with
+// `r.size` bytes, its elided UDP checksum put back; it stays there until
+// `reasm_reset`.  `SIXLO_FRAG_PENDING` when the fragment was kept.
+// `SIXLO_FRAG_DUPLICATE` for one already held.  `SIXLO_FRAG_DROPPED` when
+// fragments disagree: a different datagram_size under the same tag, or a
+// range that overlaps one held and differs from it.  `SIXLO_FRAG_BUSY` when
+// the buffer holds another datagram.  `SIXLO_FRAG_NO_FIRST` for a later
+// fragment with no first fragment held.  `SIXLO_FRAG_BAD` for a fragment
+// that cannot be read or a first fragment whose headers do not expand.
+pub @tier(embedded)
+@no_alloc
+fn reasm_input(var r: Reassembly, key: Int, var f: Frame, at: Int, var t: ContextTable,
+               src_ll: LinkAddr, dst_ll: LinkAddr) -> Int []
+    let h = frag_header(var f, at)
+    if not h.ok or h.size > lowpan.SIXLO_DG_MAX
+        return SIXLO_FRAG_BAD
+    if r.active and (r.key != key or r.tag != h.tag)
+        return SIXLO_FRAG_BUSY
+    if r.active and r.size != h.size
+        reasm_reset(var r)
+        return SIXLO_FRAG_DROPPED
+    var code = SIXLO_FRAG_PENDING
+    if h.first
+        if r.active
+            return SIXLO_FRAG_DUPLICATE
+        code = start(var r, key, h, var f, at + h.hdr_len, var t, src_ll, dst_ll)
+    else
+        if not r.active
+            return SIXLO_FRAG_NO_FIRST
+        code = place(var r, h, var f)
+    if code == SIXLO_FRAG_PENDING and r.received == r.size
+        if r.udp_off >= 0
+            let _c = lowiphc.restore_checksum(var r.buf, r.size, r.udp_off)
+            r.udp_off = -1
+        return SIXLO_FRAG_COMPLETE
+    code

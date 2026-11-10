@@ -1,0 +1,291 @@
+// lowpan_tests.nv — the dispatch space, the mesh and broadcast headers, the
+// frame walk, and the addresses.
+//
+// Every byte string is derived by hand from RFC 4944 section 5 and RFC 6282
+// section 3.2.2, and the derivation is in the comment above it.
+//
+// The mesh header (RFC 4944 section 5.2) is
+//
+//    1 0 V F HopsLeft(4) | [Deep Hops Left (8)] | originator | destination
+//
+// where V and F say the originator and the final destination are 16-bit short
+// addresses, not EUI-64s, and HopsLeft of 0xF says a byte of Deep Hops Left
+// follows.
+
+use std.test
+use lowpan
+
+fn frame(bs: [Int]) -> Vec[u8; 128]
+    var f: Vec[u8; 128] = Vec.new()
+    for b in bs
+        let _p = f.push(b as u8)
+    f
+
+@test
+fn test_the_first_byte_names_the_kind_of_frame() [io]
+    test.case("00xxxxxx is not a LoWPAN frame")
+    test.assert_eq(lowpan.kind_of(0x00), lowpan.SIXLO_KIND_NALP)
+    test.assert_eq(lowpan.kind_of(0x3F), lowpan.SIXLO_KIND_NALP)
+    test.case("01000001 is an uncompressed IPv6 header, 01000010 is HC1, 01010000 is BC0")
+    test.assert_eq(lowpan.kind_of(0x41), lowpan.SIXLO_KIND_IPV6)
+    test.assert_eq(lowpan.kind_of(0x42), lowpan.SIXLO_KIND_HC1)
+    test.assert_eq(lowpan.kind_of(0x50), lowpan.SIXLO_KIND_BC0)
+    test.case("the rest of 01xxxxxx below 011xxxxx is reserved, ESC (01000000) among it")
+    test.assert_eq(lowpan.kind_of(0x40), lowpan.SIXLO_KIND_RESERVED)
+    test.assert_eq(lowpan.kind_of(0x43), lowpan.SIXLO_KIND_RESERVED)
+    test.assert_eq(lowpan.kind_of(0x51), lowpan.SIXLO_KIND_RESERVED)
+    test.assert_eq(lowpan.kind_of(0x5F), lowpan.SIXLO_KIND_RESERVED)
+    test.case("011xxxxx is IPHC, at both edges")
+    test.assert_eq(lowpan.kind_of(0x60), lowpan.SIXLO_KIND_IPHC)
+    test.assert_eq(lowpan.kind_of(0x7F), lowpan.SIXLO_KIND_IPHC)
+    test.case("10xxxxxx is a mesh header")
+    test.assert_eq(lowpan.kind_of(0x80), lowpan.SIXLO_KIND_MESH)
+    test.assert_eq(lowpan.kind_of(0xBF), lowpan.SIXLO_KIND_MESH)
+    test.case("11000xxx is FRAG1 and 11100xxx is FRAGN")
+    test.assert_eq(lowpan.kind_of(0xC0), lowpan.SIXLO_KIND_FRAG1)
+    test.assert_eq(lowpan.kind_of(0xC7), lowpan.SIXLO_KIND_FRAG1)
+    test.assert_eq(lowpan.kind_of(0xE0), lowpan.SIXLO_KIND_FRAGN)
+    test.assert_eq(lowpan.kind_of(0xE7), lowpan.SIXLO_KIND_FRAGN)
+    test.case("the other 11xxxxxx patterns are reserved")
+    test.assert_eq(lowpan.kind_of(0xC8), lowpan.SIXLO_KIND_RESERVED)
+    test.assert_eq(lowpan.kind_of(0xDF), lowpan.SIXLO_KIND_RESERVED)
+    test.assert_eq(lowpan.kind_of(0xE8), lowpan.SIXLO_KIND_RESERVED)
+    test.assert_eq(lowpan.kind_of(0xFF), lowpan.SIXLO_KIND_RESERVED)
+
+@test
+fn test_an_interface_identifier_comes_from_the_link_address() [io]
+    test.case("a short address 0x1234 is 0000:00ff:fe00:1234")
+    let s = lowpan.ll_short(0x1234)
+    test.assert_eq(lowpan.iid_word2(s), 0x000000FF)
+    test.assert_eq(lowpan.iid_word3(s), 0xFE001234)
+    test.case("a short address is cut to 16 bits")
+    test.assert_eq(lowpan.ll_short(0x51234).b, 0x1234)
+    test.case("an extended address 00:11:22:33:44:55:66:77 has its universal/local bit inverted, 0211:2233:4455:6677")
+    let e = lowpan.ll_extended(0x00112233, 0x44556677)
+    test.assert_eq(lowpan.iid_word2(e), 0x02112233)
+    test.assert_eq(lowpan.iid_word3(e), 0x44556677)
+    test.case("inverting twice gives the address back: 02:11:... gives 0011:...")
+    test.assert_eq(lowpan.iid_word2(lowpan.ll_extended(0x02112233, 0)), 0x00112233)
+    test.case("no address gives zeros")
+    test.assert_eq(lowpan.iid_word2(lowpan.ll_none()), 0)
+    test.assert_eq(lowpan.iid_word3(lowpan.ll_none()), 0)
+    test.case("an extended address is cut to 32 bits a word")
+    test.assert_eq(lowpan.ll_extended(0x100000001, 0x200000002).a, 1)
+    test.assert_eq(lowpan.ll_extended(0x100000001, 0x200000002).b, 2)
+
+@test
+fn test_a_link_local_address_is_the_prefix_and_the_identifier() [io]
+    test.case("fe80::0211:2233:4455:6677 from the extended address")
+    let a = lowpan.link_local(lowpan.ll_extended(0x00112233, 0x44556677))
+    test.assert_eq(a.w0, 0xFE800000)
+    test.assert_eq(a.w1, 0)
+    test.assert_eq(a.w2, 0x02112233)
+    test.assert_eq(a.w3, 0x44556677)
+    test.assert_eq(lowpan.is_link_local(a), true)
+    test.case("fe80::ff:fe00:1234 from the short address")
+    let b = lowpan.link_local(lowpan.ll_short(0x1234))
+    test.assert_eq(lowpan.ip6_byte(b, 0), 0xFE)
+    test.assert_eq(lowpan.ip6_byte(b, 1), 0x80)
+    test.assert_eq(lowpan.ip6_byte(b, 11), 0xFF)
+    test.assert_eq(lowpan.ip6_byte(b, 12), 0xFE)
+    test.assert_eq(lowpan.ip6_byte(b, 14), 0x12)
+    test.assert_eq(lowpan.ip6_byte(b, 15), 0x34)
+    test.case("every byte index reads its word")
+    let c = lowpan.ip6(0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F)
+    test.assert_eq(lowpan.ip6_byte(c, 0), 0)
+    test.assert_eq(lowpan.ip6_byte(c, 5), 5)
+    test.assert_eq(lowpan.ip6_byte(c, 10), 10)
+    test.assert_eq(lowpan.ip6_byte(c, 15), 15)
+    test.assert_eq(lowpan.ip6_word(c, 0), 0x00010203)
+    test.assert_eq(lowpan.ip6_word(c, 1), 0x04050607)
+    test.assert_eq(lowpan.ip6_word(c, 2), 0x08090A0B)
+    test.assert_eq(lowpan.ip6_word(c, 3), 0x0C0D0E0F)
+
+@test
+fn test_address_classes_and_equality() [io]
+    test.case("the unspecified address")
+    test.assert_eq(lowpan.is_unspecified(lowpan.ip6_unspecified()), true)
+    test.assert_eq(lowpan.is_unspecified(lowpan.ip6(0, 0, 0, 1)), false)
+    test.assert_eq(lowpan.is_unspecified(lowpan.ip6(0, 0, 1, 0)), false)
+    test.assert_eq(lowpan.is_unspecified(lowpan.ip6(0, 1, 0, 0)), false)
+    test.assert_eq(lowpan.is_unspecified(lowpan.ip6(1, 0, 0, 0)), false)
+    test.case("multicast is ff00::/8")
+    test.assert_eq(lowpan.is_multicast(lowpan.ip6(0xFF020000, 0, 0, 1)), true)
+    test.assert_eq(lowpan.is_multicast(lowpan.ip6(0xFE800000, 0, 0, 1)), false)
+    test.case("link-local needs the prefix and the next 48 bits zero")
+    test.assert_eq(lowpan.is_link_local(lowpan.ip6(0xFE800000, 0, 5, 5)), true)
+    test.assert_eq(lowpan.is_link_local(lowpan.ip6(0xFE800000, 1, 5, 5)), false)
+    test.assert_eq(lowpan.is_link_local(lowpan.ip6(0xFE800001, 0, 5, 5)), false)
+    test.case("equality compares every word")
+    let a = lowpan.ip6(1, 2, 3, 4)
+    test.assert_eq(lowpan.ip6_eq(a, lowpan.ip6(1, 2, 3, 4)), true)
+    test.assert_eq(lowpan.ip6_eq(a, lowpan.ip6(0, 2, 3, 4)), false)
+    test.assert_eq(lowpan.ip6_eq(a, lowpan.ip6(1, 0, 3, 4)), false)
+    test.assert_eq(lowpan.ip6_eq(a, lowpan.ip6(1, 2, 0, 4)), false)
+    test.assert_eq(lowpan.ip6_eq(a, lowpan.ip6(1, 2, 3, 0)), false)
+    test.case("a word is cut to 32 bits")
+    test.assert_eq(lowpan.ip6(0x1FFFFFFFF, 0, 0, 0).w0, 0xFFFFFFFF)
+
+@test
+fn test_a_mesh_header_with_short_addresses_is_read() [io]
+    test.case("10 V=1 F=1 hops=5, originator 0x0001, destination 0x0002")
+    var f = frame([0xB5, 0x00, 0x01, 0x00, 0x02])
+    let m = lowpan.mesh_header(var f, 0)
+    test.assert_eq(m.ok, true)
+    test.assert_eq(m.hops_left, 5)
+    test.assert_eq(m.originator.kind, lowpan.SIXLO_LL_SHORT)
+    test.assert_eq(m.originator.b, 1)
+    test.assert_eq(m.destination.kind, lowpan.SIXLO_LL_SHORT)
+    test.assert_eq(m.destination.b, 2)
+    test.assert_eq(m.len, 5)
+    test.case("read from an offset into the frame")
+    var g = frame([0x99, 0xB5, 0x00, 0x01, 0x00, 0x02])
+    let n = lowpan.mesh_header(var g, 1)
+    test.assert_eq(n.ok, true)
+    test.assert_eq(n.originator.b, 1)
+
+@test
+fn test_a_mesh_header_with_extended_addresses_is_read() [io]
+    test.case("10 V=0 F=0 hops=2, two EUI-64s")
+    var f = frame([0x82,
+        0x02,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0xAA,
+        0xBB,
+        0x02,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0xCC,
+        0xDD])
+    let m = lowpan.mesh_header(var f, 0)
+    test.assert_eq(m.ok, true)
+    test.assert_eq(m.hops_left, 2)
+    test.assert_eq(m.originator.kind, lowpan.SIXLO_LL_EXTENDED)
+    test.assert_eq(m.originator.a, 0x02000000)
+    test.assert_eq(m.originator.b, 0x0000AABB)
+    test.assert_eq(m.destination.b, 0x0000CCDD)
+    test.assert_eq(m.len, 17)
+    test.case("10 V=1 F=0 hops=3: a short originator and an extended destination")
+    var g = frame([0xA3, 0x12, 0x34, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xCC, 0xDD])
+    let n = lowpan.mesh_header(var g, 0)
+    test.assert_eq(n.ok, true)
+    test.assert_eq(n.originator.kind, lowpan.SIXLO_LL_SHORT)
+    test.assert_eq(n.originator.b, 0x1234)
+    test.assert_eq(n.destination.kind, lowpan.SIXLO_LL_EXTENDED)
+    test.assert_eq(n.len, 11)
+    test.case("10 V=0 F=1: an extended originator and a short destination")
+    var h = frame([0x92, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0x00, 0x09])
+    let o = lowpan.mesh_header(var h, 0)
+    test.assert_eq(o.ok, true)
+    test.assert_eq(o.originator.kind, lowpan.SIXLO_LL_EXTENDED)
+    test.assert_eq(o.destination.b, 9)
+
+@test
+fn test_hops_left_of_fifteen_is_followed_by_deep_hops_left() [io]
+    test.case("1011 1111 then 0x20: 32 hops, two short addresses, 6 bytes")
+    var f = frame([0xBF, 0x20, 0x00, 0x01, 0x00, 0x02])
+    let m = lowpan.mesh_header(var f, 0)
+    test.assert_eq(m.ok, true)
+    test.assert_eq(m.hops_left, 32)
+    test.assert_eq(m.len, 6)
+    test.assert_eq(m.destination.b, 2)
+    test.case("a frame that ends at the deep byte")
+    var g = frame([0xBF])
+    test.assert_eq(lowpan.mesh_header(var g, 0).ok, false)
+
+@test
+fn test_a_mesh_header_that_is_not_one_or_is_cut_short_is_not_ok() [io]
+    test.case("an IPHC byte is not a mesh dispatch")
+    var f = frame([0x7A, 0x33, 0x00, 0x00, 0x00])
+    test.assert_eq(lowpan.mesh_header(var f, 0).ok, false)
+    test.case("an offset outside the frame")
+    var g = frame([0xB5, 0x00, 0x01, 0x00, 0x02])
+    test.assert_eq(lowpan.mesh_header(var g, 5).ok, false)
+    test.assert_eq(lowpan.mesh_header(var g, -1).ok, false)
+    test.case("addresses that run past the end")
+    var h = frame([0xB5, 0x00, 0x01, 0x00])
+    test.assert_eq(lowpan.mesh_header(var h, 0).ok, false)
+
+@test
+fn test_the_headers_in_front_of_a_datagram_are_walked_in_order() [io]
+    test.case("a bare IPHC frame")
+    var a = frame([0x7A, 0x33, 0x3A])
+    let va = lowpan.inspect(var a)
+    test.assert_eq(va.status, lowpan.SIXLO_VIEW_OK)
+    test.assert_eq(va.has_mesh, false)
+    test.assert_eq(va.has_bc0, false)
+    test.assert_eq(va.payload_kind, lowpan.SIXLO_KIND_IPHC)
+    test.assert_eq(va.payload_off, 0)
+    test.case("BC0 with sequence 7, then IPHC")
+    var b = frame([0x50, 0x07, 0x7A, 0x33])
+    let vb = lowpan.inspect(var b)
+    test.assert_eq(vb.has_bc0, true)
+    test.assert_eq(vb.bc0_seq, 7)
+    test.assert_eq(vb.payload_kind, lowpan.SIXLO_KIND_IPHC)
+    test.assert_eq(vb.payload_off, 2)
+    test.case("mesh (5 bytes), BC0 (2 bytes), FRAG1 at 7")
+    var c = frame([0xB5, 0x00, 0x01, 0x00, 0x02, 0x50, 0x09, 0xC1, 0x2C, 0xBE, 0xEF, 0x7A])
+    let vc = lowpan.inspect(var c)
+    test.assert_eq(vc.status, lowpan.SIXLO_VIEW_OK)
+    test.assert_eq(vc.has_mesh, true)
+    test.assert_eq(vc.mesh.hops_left, 5)
+    test.assert_eq(vc.has_bc0, true)
+    test.assert_eq(vc.bc0_seq, 9)
+    test.assert_eq(vc.payload_kind, lowpan.SIXLO_KIND_FRAG1)
+    test.assert_eq(vc.payload_off, 7)
+    test.case("mesh and then FRAGN")
+    var d = frame([0xB5, 0x00, 0x01, 0x00, 0x02, 0xE1, 0x2C, 0xBE, 0xEF, 0x05])
+    let vd = lowpan.inspect(var d)
+    test.assert_eq(vd.payload_kind, lowpan.SIXLO_KIND_FRAGN)
+    test.assert_eq(vd.payload_off, 5)
+    test.case("an uncompressed IPv6 dispatch")
+    var e = frame([0x41, 0x60])
+    test.assert_eq(lowpan.inspect(var e).payload_kind, lowpan.SIXLO_KIND_IPV6)
+    test.case("HC1 is reported as it is, not decoded")
+    var g = frame([0x42, 0x00])
+    test.assert_eq(lowpan.inspect(var g).payload_kind, lowpan.SIXLO_KIND_HC1)
+
+@test
+fn test_a_frame_that_breaks_the_header_order_or_is_cut_short_is_a_fault() [io]
+    test.case("an empty frame")
+    var a = frame([])
+    test.assert_eq(lowpan.inspect(var a).status, lowpan.SIXLO_VIEW_SHORT)
+    test.case("a NALP frame")
+    var b = frame([0x01, 0x02])
+    test.assert_eq(lowpan.inspect(var b).status, lowpan.SIXLO_VIEW_NOT_LOWPAN)
+    test.case("two mesh headers")
+    var c = frame([0xB5, 0x00, 0x01, 0x00, 0x02, 0xB5, 0x00, 0x01, 0x00, 0x02, 0x7A])
+    test.assert_eq(lowpan.inspect(var c).status, lowpan.SIXLO_VIEW_ORDER)
+    test.case("a mesh header after BC0")
+    var d = frame([0x50, 0x01, 0xB5, 0x00, 0x01, 0x00, 0x02, 0x7A])
+    test.assert_eq(lowpan.inspect(var d).status, lowpan.SIXLO_VIEW_ORDER)
+    test.case("two BC0 headers")
+    var e = frame([0x50, 0x01, 0x50, 0x02, 0x7A])
+    test.assert_eq(lowpan.inspect(var e).status, lowpan.SIXLO_VIEW_ORDER)
+    test.case("a mesh header cut short")
+    var g = frame([0xB5, 0x00])
+    test.assert_eq(lowpan.inspect(var g).status, lowpan.SIXLO_VIEW_SHORT)
+    test.case("BC0 with no sequence byte")
+    var h = frame([0x50])
+    test.assert_eq(lowpan.inspect(var h).status, lowpan.SIXLO_VIEW_SHORT)
+    test.case("headers and then nothing")
+    var i = frame([0x50, 0x01])
+    test.assert_eq(lowpan.inspect(var i).status, lowpan.SIXLO_VIEW_SHORT)
+    test.case("a mesh header, BC0 and then a third header")
+    var j = frame([0xB5, 0x00, 0x01, 0x00, 0x02, 0x50, 0x09, 0x50, 0x0A, 0x7A])
+    test.assert_eq(lowpan.inspect(var j).status, lowpan.SIXLO_VIEW_ORDER)
+    var k = frame([0xB5, 0x00, 0x01, 0x00, 0x02, 0x50, 0x09, 0xB5, 0x00, 0x01, 0x00, 0x02])
+    test.assert_eq(lowpan.inspect(var k).status, lowpan.SIXLO_VIEW_ORDER)
+    test.case("a mesh header, BC0 and then a NALP byte")
+    var m = frame([0xB5, 0x00, 0x01, 0x00, 0x02, 0x50, 0x09, 0x01])
+    test.assert_eq(lowpan.inspect(var m).status, lowpan.SIXLO_VIEW_NOT_LOWPAN)
+    test.case("a mesh header and BC0 and then nothing")
+    var n = frame([0xB5, 0x00, 0x01, 0x00, 0x02, 0x50, 0x09])
+    test.assert_eq(lowpan.inspect(var n).status, lowpan.SIXLO_VIEW_SHORT)

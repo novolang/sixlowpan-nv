@@ -1,0 +1,22 @@
+[package]
+name        = "sixlowpan-nv"
+version     = "0.1.0"
+description = "IPv6 over IEEE 802.15.4 for novo-lang: the dispatch space, the mesh and broadcast headers and the fragment headers of RFC 4944 with a reassembly buffer of fixed capacity and a timeout the caller drives, and the IPv6 header compression of RFC 6282 with its context table, UDP and extension header encodings.  Over buffers the caller owns, with no allocation and no radio."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "core"
+tags        = ["6lowpan", "ipv6", "ieee-802-15-4", "rfc4944", "rfc6282", "iphc", "fragmentation", "iot", "embedded", "sans-io", "no-alloc"]
+repository  = "https://github.com/novolang/sixlowpan-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "IPv6 over IEEE 802.15.4: headers, compression and fragments for a node with no heap"
+
+[dependencies]
+# None.  A frame is bytes in a buffer the caller owns, and the state of a
+# reassembly, a context table and a header walk is integers.
