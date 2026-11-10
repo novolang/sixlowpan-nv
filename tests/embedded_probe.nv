@@ -113,8 +113,7 @@ fn score() -> Int
     build(var big, 300)
     var hdr: Frame = Vec.new()
     let p = lowiphc.compress(var big, 300, s1, s2, var t, false, var hdr)
-    // workaround(a-vec-of-an-alias-imported-from-another-module-is-not-resolved): a Vec of an imported alias is not built, so the element is spelled out
-    var frames: Vec[Vec[u8; 128]; 4] = Vec.new()
+    var frames: Vec[Frame; 4] = Vec.new()
     var done = lowfrag.frag_first(var out, var big, 300, var hdr, p.covered, 0xBEEF, 80)
     let _a = frames.push(out)
     for _i in 0..3

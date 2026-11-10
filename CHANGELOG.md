@@ -42,11 +42,4 @@ The first release.
   recovery (RFC 8931).
 - Reassembly of a later fragment that arrives before the first.
 
-### Known
-
-- A `Vec` whose element is an alias imported from another module is not built,
-  so the device probe spells out `Vec[Vec[u8; 128]; 4]` where the type of a
-  frame is `Frame`. The filing is
-  `a-vec-of-an-alias-imported-from-another-module-is-not-resolved`.
-
 This release requires novo 0.23.0 or later.
